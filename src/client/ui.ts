@@ -17,6 +17,35 @@ export function h<K extends keyof HTMLElementTagNameMap>(tag: K, attrs: Attrs = 
   return node;
 }
 
+// ------------------------------------------------------------- theme
+
+// Light by default; index.html applies the stored choice before first paint.
+const THEME_KEY = 'texwerk-theme';
+export const THEME_EVENT = 'texwerk-theme';
+
+export function isDark(): boolean {
+  return document.documentElement.dataset.theme === 'dark';
+}
+
+export function setTheme(dark: boolean): void {
+  document.documentElement.dataset.theme = dark ? 'dark' : 'light';
+  try { localStorage.setItem(THEME_KEY, dark ? 'dark' : 'light'); } catch { /* private window */ }
+  window.dispatchEvent(new Event(THEME_EVENT));
+}
+
+/** A toolbar button that switches between the light and the dark theme. */
+export function themeButton(): HTMLButtonElement {
+  const btn = h('button', { class: 'theme-toggle' });
+  const label = () => {
+    btn.textContent = isDark() ? '☀' : '☾';
+    btn.title = isDark() ? 'Switch to the light theme' : 'Switch to the dark theme';
+  };
+  btn.addEventListener('click', () => setTheme(!isDark()));
+  window.addEventListener(THEME_EVENT, label);
+  label();
+  return btn;
+}
+
 // ------------------------------------------------------------- identity
 
 const NAME_KEY = 'texwerk-name';

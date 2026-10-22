@@ -26,6 +26,14 @@
   --cyan: #7dcfff;
   --radius: 0;
   --mono: "Monaspace Krypton", ui-monospace, monospace;
+  --syn-keyword: #7aa2f7;
+  --syn-atom: #ff9e64;
+  --syn-string: #9ece6a;
+  --syn-comment: #565f89;
+  --syn-bracket: #bb9af7;
+  --syn-variable: #7dcfff;
+  --syn-heading: #e0af68;
+  --syn-operator: #89ddff;
 }
 
 * { box-sizing: border-box; }
@@ -801,3 +809,59 @@ button.busy { opacity: .75; cursor: progress; }
 .cm-spell-error { text-decoration: underline wavy var(--danger); text-decoration-thickness: 1px; text-underline-offset: 3px; text-decoration-skip-ink: none; }
 .cm-spell-grammar { text-decoration: underline wavy var(--accent); text-decoration-thickness: 1px; text-underline-offset: 3px; text-decoration-skip-ink: none; }
 .menu .menu-head.spell-message { text-transform: none; letter-spacing: 0; max-width: 320px; white-space: normal; }
+
+/* ------------------------------------------------------------ light theme */
+
+/* The default (ui.ts setTheme; the ☾/☀ button switches). Overleaf-like:
+   white editor, light grey chrome, grey around the PDF pages. */
+:root[data-theme="light"] {
+  color-scheme: light;
+  --bg: #ffffff;
+  --panel: #f5f6f8;
+  --panel-2: #e8eaee;
+  --line: #d4d7dd;
+  --text: #1f2328;
+  --muted: #6e7781;
+  --dim: #57606a;
+  --accent: #0b7a3e;
+  --accent-soft: rgb(11 122 62 / 10%);
+  --green: #1a7f37;
+  --yellow: #9a6700;
+  --danger: #cf222e;
+  --purple: #8250df;
+  --cyan: #0a6a8f;
+  --syn-keyword: #1a4fb4;
+  --syn-atom: #b35900;
+  --syn-string: #1a7f37;
+  --syn-comment: #6a8a6a;
+  --syn-bracket: #8250df;
+  --syn-variable: #0a6a8f;
+  --syn-heading: #953800;
+  --syn-operator: #57606a;
+}
+[data-theme="light"] button.primary { background: var(--accent); color: #fff; }
+[data-theme="light"] button.primary:hover:not(:disabled) { background: #096a35; }
+[data-theme="light"] .cm-activeLine { background: rgb(0 0 0 / 3.5%) !important; }
+[data-theme="light"] .cm-selectionBackground,
+[data-theme="light"] .cm-focused .cm-selectionBackground,
+[data-theme="light"] ::selection { background: rgb(9 105 218 / 20%) !important; }
+[data-theme="light"] .cm-searchMatch { background: rgb(255 200 60 / 35%) !important; }
+[data-theme="light"] .cm-searchMatch-selected { background: rgb(255 170 0 / 50%) !important; }
+/* Author colours are pastels: dark letters read better on them here. */
+[data-theme="light"] .presence .person,
+[data-theme="light"] .cm-comment-marker { color: #1f2328; }
+[data-theme="light"] .viewer-body { background: #d9dce1; }
+[data-theme="light"] .pdf-page,
+[data-theme="light"] .image-view img { box-shadow: 0 1px 6px rgb(0 0 0 / 22%); }
+[data-theme="light"] .image-view { background: repeating-conic-gradient(#eceef1 0% 25%, #ffffff 0% 50%) 50% / 20px 20px; }
+[data-theme="light"] .dialog pre.cmd,
+[data-theme="light"] .dialog pre.out { background: #f6f8fa; }
+[data-theme="light"] .backdrop { background: rgb(31 35 40 / 35%); }
+[data-theme="light"] .picker-overlay:not(.landing) { background: rgb(31 35 40 / 40%); }
+[data-theme="light"] .drop-overlay { background: rgb(255 255 255 / 85%); }
+[data-theme="light"] .dialog,
+[data-theme="light"] .comment-popover,
+[data-theme="light"] .picker { box-shadow: 0 12px 36px rgb(0 0 0 / 18%); }
+[data-theme="light"] .menu,
+[data-theme="light"] .toast,
+[data-theme="light"] .cm-comment-tip button { box-shadow: 0 6px 18px rgb(0 0 0 / 15%); }

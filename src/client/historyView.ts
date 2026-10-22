@@ -3,6 +3,7 @@ import { EditorView, lineNumbers } from '@codemirror/view';
 import { unifiedMergeView } from '@codemirror/merge';
 import { colorFor } from '@shared/files.ts';
 import type { GitLabel, HistoryEntry } from '@shared/protocol.ts';
+import { themeMode } from './codeEditor.ts';
 import { api, confirmDialog, formatTime, h, toast, withName } from './ui.ts';
 
 /**
@@ -242,7 +243,7 @@ export class HistoryView {
           EditorState.readOnly.of(true),
           EditorView.lineWrapping,
           unifiedMergeView({ original: oldText, mergeControls: false, highlightChanges: true, gutter: true, collapseUnchanged: { margin: 3, minSize: 6 } }),
-          EditorView.theme({}, { dark: true }),
+          themeMode(),
         ],
       }),
     });

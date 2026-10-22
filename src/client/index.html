@@ -5,6 +5,11 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>TeXWerk</title>
   <link rel="icon" href="./favicon.svg" type="image/svg+xml">
+  <script>
+    // Before the stylesheet, so a dark choice does not flash light first.
+    try { document.documentElement.dataset.theme = localStorage.getItem('texwerk-theme') === 'dark' ? 'dark' : 'light'; }
+    catch { document.documentElement.dataset.theme = 'light'; }
+  </script>
   <link rel="stylesheet" href="./style.css">
 </head>
 <body>

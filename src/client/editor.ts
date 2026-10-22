@@ -12,7 +12,7 @@ import { Chat } from './chat.ts';
 import { authorRuns } from '@shared/provenance.ts';
 import type { AuthorInfo } from '@shared/protocol.ts';
 import type { CommentThread } from '@shared/comments.ts';
-import { api, copyText, dialog, h, initials, menu, storedName, storeName, toast, withName } from './ui.ts';
+import { api, copyText, dialog, h, initials, menu, storedName, storeName, themeButton, toast, withName } from './ui.ts';
 import { showPicker, showShareDialog, type Me } from './picker.ts';
 
 /**
@@ -79,7 +79,7 @@ export async function renderEditor(app: HTMLElement, project: string, meInfo: Me
     h('span', { class: 'spacer' }),
     presenceEl,
     h('span', { class: 'sep' }),
-    historyBtn, labelBtn, gitBtn, agentBtn, ...(access ? [shareBtn] : []), downloadBtn, paneToggle);
+    historyBtn, labelBtn, gitBtn, agentBtn, ...(access ? [shareBtn] : []), downloadBtn, themeButton(), paneToggle);
 
   const statusConn = h('span', {}, h('span', { class: 'dot' }), 'connecting');
   const statusCompile = h('span', {});

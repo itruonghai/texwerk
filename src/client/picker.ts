@@ -1,4 +1,4 @@
-import { api, confirmDialog, copyText, dialog, h, menu, prompt, toast } from './ui.ts';
+import { api, confirmDialog, copyText, dialog, h, menu, prompt, themeButton, toast } from './ui.ts';
 
 /**
  * The projects browser, ported from DeckWerk's deck picker: a file manager
@@ -269,7 +269,7 @@ export function showPicker(opts: { me: Me; dismissable: boolean; folder?: string
 
   const who = opts.me.access ? h('span', { class: 'picker-who', title: opts.me.you.login }, `${opts.me.you.name}${opts.me.admin ? ' · admin' : ''}`) : '';
   box.append(
-    h('div', { class: 'picker-head' }, h('h2', {}, 'Projects on this server'), trail, who),
+    h('div', { class: 'picker-head' }, h('h2', {}, 'Projects on this server'), trail, who, themeButton()),
     h('div', { class: 'picker-columns' }, rowGroup(pickerRow('div', 'Name', ['Size', 'Last edit', 'Created', 'Editing', 'Owner', 'Access']), [])),
     list,
     h('div', { class: 'picker-foot' }, progress, actions));

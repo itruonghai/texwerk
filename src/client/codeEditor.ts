@@ -2,7 +2,7 @@ import { Compartment, EditorSelection, EditorState, type Extension } from '@code
 import {
   EditorView, keymap, lineNumbers, highlightActiveLine, highlightActiveLineGutter, drawSelection,
   dropCursor, rectangularSelection, crosshairCursor, highlightSpecialChars, Decoration, type DecorationSet,
-  gutter, GutterMarker, showTooltip, type Tooltip,
+  gutter, GutterMarker, showTooltip, type Tooltip, ViewPlugin,
 } from '@codemirror/view';
 import { RangeSet, StateEffect, StateField, type EditorState as State } from '@codemirror/state';
 import { defaultKeymap, indentWithTab } from '@codemirror/commands';
@@ -20,6 +20,7 @@ import type { Awareness } from 'y-protocols/awareness';
 import { extensionOf } from '@shared/files.ts';
 import { latexSupport, type LatexProject } from './latex.ts';
 import { spellcheck } from './spellcheck.ts';
+import { isDark, THEME_EVENT } from './ui.ts';
 import { isProseFile } from '@shared/prose.ts';
 
 /**
@@ -28,20 +29,35 @@ import { isProseFile } from '@shared/prose.ts';
  * only tracks this client's own edits), so undo never reverts a collaborator.
  */
 
+// The colours are CSS variables (style.css), so they follow the theme.
 const tokyo = HighlightStyle.define([
-  { tag: [t.keyword, t.tagName], color: '#7aa2f7' },
-  { tag: [t.atom, t.bool, t.special(t.variableName)], color: '#ff9e64' },
-  { tag: [t.number], color: '#ff9e64' },
-  { tag: [t.string, t.special(t.string)], color: '#9ece6a' },
-  { tag: [t.comment, t.lineComment, t.blockComment], color: '#565f89', fontStyle: 'italic' },
-  { tag: [t.bracket, t.brace, t.squareBracket, t.paren], color: '#bb9af7' },
-  { tag: [t.variableName, t.typeName], color: '#7dcfff' },
-  { tag: [t.definition(t.variableName), t.function(t.variableName)], color: '#7dcfff' },
-  { tag: [t.heading], color: '#e0af68', fontWeight: 'bold' },
-  { tag: [t.meta, t.processingInstruction], color: '#e0af68' },
-  { tag: [t.operator], color: '#89ddff' },
-  { tag: [t.invalid], color: '#f7768e' },
+  { tag: [t.keyword, t.tagName], color: 'var(--syn-keyword)' },
+  { tag: [t.atom, t.bool, t.special(t.variableName)], color: 'var(--syn-atom)' },
+  { tag: [t.number], color: 'var(--syn-atom)' },
+  { tag: [t.string, t.special(t.string)], color: 'var(--syn-string)' },
+  { tag: [t.comment, t.lineComment, t.blockComment], color: 'var(--syn-comment)', fontStyle: 'italic' },
+  { tag: [t.bracket, t.brace, t.squareBracket, t.paren], color: 'var(--syn-bracket)' },
+  { tag: [t.variableName, t.typeName], color: 'var(--syn-variable)' },
+  { tag: [t.definition(t.variableName), t.function(t.variableName)], color: 'var(--syn-variable)' },
+  { tag: [t.heading], color: 'var(--syn-heading)', fontWeight: 'bold' },
+  { tag: [t.meta, t.processingInstruction], color: 'var(--syn-heading)' },
+  { tag: [t.operator], color: 'var(--syn-operator)' },
+  { tag: [t.invalid], color: 'var(--danger)' },
 ]);
+
+/** CodeMirror's own light or dark defaults, switched with the page theme. */
+export function themeMode(): Extension {
+  const mode = new Compartment();
+  const of = () => EditorView.theme({}, { dark: isDark() });
+  return [
+    mode.of(of()),
+    ViewPlugin.define((view) => {
+      const onTheme = () => view.dispatch({ effects: mode.reconfigure(of()) });
+      window.addEventListener(THEME_EVENT, onTheme);
+      return { destroy: () => window.removeEventListener(THEME_EVENT, onTheme) };
+    }),
+  ];
+}
 
 // Flash a line after a jump (from the log, SyncTeX, or following someone).
 const flashEffect = StateEffect.define<number>();
@@ -332,7 +348,7 @@ export class CodeEditor {
             opts.onCursor(line.number, head - line.from + 1);
           }
         }),
-        EditorView.theme({}, { dark: true }),
+        themeMode(),
       ],
     });
     this.view = new EditorView({ state, parent });
