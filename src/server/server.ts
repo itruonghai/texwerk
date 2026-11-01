@@ -2,17 +2,22 @@ import { createReadStream, existsSync } from 'node:fs';
 import { mkdir, readdir, readFile, realpath, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { hostname, networkInterfaces } from 'node:os';
+import type { Duplex } from 'node:stream';
 import { extname, join, resolve } from 'node:path';
 import { WebSocketServer } from 'ws';
 import { cleanPath, cleanProjectId, cleanProjectName } from '../shared/files.ts';
-import { BRIDGE_HEADER, type Identity, type ProjectSettings } from '../shared/protocol.ts';
+import { BRIDGE_HEADER, CLOSE_SIGN_IN_EXPIRED, type Identity, type ProjectSettings } from '../shared/protocol.ts';
 import { setupCompileSandbox, synctex } from './compile.ts';
 import * as gitOps from './git.ts';
 import { resolveIdentity, type AccessConfig } from './identity.ts';
 import {
-  canManage, FOLDER_MARKER, folderVisibleTo, normalizeLogin, normalizeShares, readAccess, readFolderOwner, roleFor,
+  canManage, FOLDER_MARKER, folderVisibleTo, isGuest, normalizeLogin, normalizeShares, readAccess, readFolderOwner, roleFor,
   UserDirectory, writeAccess, writeFolderMarker, type ProjectAccess, type ProjectRole,
 } from './access.ts';
+import {
+  admitCloudflareSocket, cloudflareSessionEndsAt, createCloudflareAccessVerifier, isCloudflareRequest,
+  type CloudflareAccessConfig,
+} from './cloudflareAccess.ts';
 import { itemPath, listTrash, moveToTrash, restoreFromTrash, ROOT_TRASH, validTrashId, type TrashMeta } from './trash.ts';
 import { Project, type Conn } from './project.ts';
 import { readZip, writeZip } from './zip.ts';
@@ -39,6 +44,27 @@ export interface ServerOptions {
   access: AccessConfig | null;
   /** Host names besides the ones `hostAllowed` accepts on its own (see origin.ts). */
   allowHosts?: string[];
+  /**
+   * A second, loopback-only listener for a Cloudflare Tunnel behind Cloudflare
+   * Access (cloudflareAccess.ts). Needs `access`. `publicUrl` is the address
+   * people open; its host name is allowed like an `--allow-host`.
+   */
+  cloudflare?: CloudflareAccessConfig & { port: number; publicUrl?: string };
+}
+
+/** Routes a guest (see isGuest) may not use: anything beyond the projects shared with them. */
+const GUEST_FORBIDDEN_ANY = new Set(['/api/users', '/api/projects/trash', '/api/projects/trash/restore']);
+const GUEST_FORBIDDEN_WRITES = new Set([
+  '/api/projects', '/api/projects/import', '/api/projects/clone', '/api/projects/move', '/api/projects/rename',
+  '/api/projects/delete', '/api/folders', '/api/folders/rename',
+  // Where the server's git connects, and with which key, stays with the
+  // people on the tailnet: a remote URL is a request this machine makes.
+  '/api/git/remote', '/api/git/deploy-key',
+]);
+
+function guestForbidden(path: string, method: string): boolean {
+  if (GUEST_FORBIDDEN_ANY.has(path)) return true;
+  return method !== 'GET' && method !== 'HEAD' && GUEST_FORBIDDEN_WRITES.has(path);
 }
 
 const MIME: Record<string, string> = {
@@ -167,6 +193,10 @@ export async function startServer(options: ServerOptions) {
   /** Projects whose folder is being renamed: nobody may (re)open the old id meanwhile. */
   const relocating = new Set<string>();
   const access = options.access ? { admin: normalizeLogin(options.access.admin) } : null;
+  if (options.cloudflare && !access) throw new Error('the Cloudflare listener needs --access');
+  const cloudflare = options.cloudflare ? createCloudflareAccessVerifier(options.cloudflare) : null;
+  const allowHosts = [...options.allowHosts ?? []];
+  if (options.cloudflare?.publicUrl) allowHosts.push(new URL(options.cloudflare.publicUrl).hostname);
   const rootTrash = join(rootDir, ROOT_TRASH);
   const users = access ? new UserDirectory(join(rootDir, '.texwerk-users.json')) : null;
 
@@ -212,7 +242,7 @@ export async function startServer(options: ServerOptions) {
   /** The role this identity has on a project; everyone owns everything without --access. */
   async function roleOf(identity: Identity, id: string): Promise<ProjectRole | null> {
     if (!access) return 'owner';
-    return roleFor(identity.login, await readAccess(dirOf(id), access), access);
+    return roleFor(identity.login, await readAccess(dirOf(id), access), access, isGuest(identity, access));
   }
 
   async function requireRole(identity: Identity, id: string, need: 'view' | 'edit' | 'manage'): Promise<ProjectRole> {
@@ -295,7 +325,7 @@ export async function startServer(options: ServerOptions) {
           continue;
         }
         const projectAccess = access ? await readAccess(childDir, access) : null;
-        const role = access ? roleFor(identity.login, projectAccess!, access) : 'owner';
+        const role = access ? roleFor(identity.login, projectAccess!, access, isGuest(identity, access)) : 'owner';
         if (!role) continue;
         accessible += 1;
         const dirStat = await stat(childDir);
@@ -363,9 +393,17 @@ export async function startServer(options: ServerOptions) {
     return url.searchParams.get('newName') ?? url.searchParams.get('name');
   }
 
-  function identityOf(request: IncomingMessage, url: URL): Identity {
+  async function identityOf(request: IncomingMessage, url: URL): Promise<Identity> {
+    // On the Cloudflare listener, check the sign-in token first: it is all
+    // resolveIdentity trusts there.
+    const viaCloudflare = isCloudflareRequest(request);
+    if (viaCloudflare) await cloudflare?.admit(request);
     const identity = resolveIdentity(request, options.access, url.searchParams.get('name') ?? request.headers['x-texwerk-name'] as string ?? null);
-    if (!identity) throw new HttpError(403, 'unidentified connection — this server is reachable only through tailscale serve');
+    if (!identity) {
+      throw new HttpError(403, viaCloudflare
+        ? 'not signed in — open this server through its Cloudflare Access address'
+        : 'unidentified connection — this server is reachable only through tailscale serve');
+    }
     return identity;
   }
 
@@ -373,10 +411,16 @@ export async function startServer(options: ServerOptions) {
     const url = new URL(request.url ?? '/', 'http://localhost');
     const path = decodeURIComponent(url.pathname);
     const method = request.method ?? 'GET';
-    const refused = refusal(request, options.allowHosts ?? []);
+    const refused = refusal(request, allowHosts);
     if (refused) throw new HttpError(403, refused);
-    const identity = identityOf(request, url);
+    const identity = await identityOf(request, url);
     if (users) void users.note(identity);
+    // A guest from the internet (the Cloudflare door) works only inside
+    // projects shared with them. Everything that reaches beyond one project —
+    // creating, importing, moving, the trash, the list of everyone on this
+    // server, where git connects — is for the people on the tailnet.
+    const guest = Boolean(access && isGuest(identity, access));
+    if (guest && guestForbidden(path, method)) throw new HttpError(403, 'guests can open what is shared with them, but not this');
     const bridge = request.headers[BRIDGE_HEADER] === '1';
     const who = bridge ? `${identity.name} · agent` : identity.name;
     const projectParam = url.searchParams.get('project');
@@ -456,7 +500,7 @@ export async function startServer(options: ServerOptions) {
 
     // ---------------------------------------------------------------- api
     if (path === '/api/me') {
-      return json(response, 200, { you: identity, access: Boolean(access), admin: !access || identity.login === access.admin, host: hostname() });
+      return json(response, 200, { you: identity, access: Boolean(access), admin: !access || identity.login === access.admin, guest, host: hostname() });
     }
 
     if (path === '/api/projects' && method === 'GET') return json(response, 200, await catalog(identity));
@@ -700,7 +744,7 @@ export async function startServer(options: ServerOptions) {
         const p = open ? await open.catch(() => null) : null;
         if (p) {
           for (const c of p.conns) {
-            const nowRole = roleFor(c.identity.login, next, access);
+            const nowRole = roleFor(c.identity.login, next, access, isGuest(c.identity, access));
             if (!nowRole || (nowRole === 'view') !== c.readOnly) c.ws.close(4401, 'access changed');
           }
         }
@@ -1034,31 +1078,39 @@ export async function startServer(options: ServerOptions) {
     throw new HttpError(404, 'not found');
   }
 
-  const server = createServer((request, response) => {
+  const onRequest = (request: IncomingMessage, response: ServerResponse) => {
     handle(request, response).catch((err: unknown) => {
       const status = err instanceof HttpError ? err.status : 500;
       if (status === 500) console.error(err);
       if (!response.headersSent) json(response, status, { error: (err as Error).message });
       else response.end();
     });
-  });
+  };
 
   const wss = new WebSocketServer({ noServer: true, maxPayload: 64 * 1024 * 1024 });
-  server.on('upgrade', (request, socket, head) => {
+  const onUpgrade = async (request: IncomingMessage, socket: Duplex, head: Buffer) => {
     const url = new URL(request.url ?? '/', 'http://localhost');
     if (url.pathname !== '/ws') { socket.destroy(); return; }
-    if (refusal(request, options.allowHosts ?? [])) {
+    if (refusal(request, allowHosts)) {
       socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
       socket.destroy();
       return;
     }
     let identity: Identity;
-    try { identity = identityOf(request, url); } catch {
+    try { identity = await identityOf(request, url); } catch {
       socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
       socket.destroy();
       return;
     }
+    if (socket.destroyed) return;
     wss.handleUpgrade(request, socket, head, (ws) => {
+      // A socket outlives the sign-in it was opened with: close it when that
+      // runs out, so the page goes through the sign-in again.
+      const endsAt = cloudflareSessionEndsAt(request);
+      if (endsAt !== null) {
+        const expiry = setTimeout(() => ws.close(CLOSE_SIGN_IN_EXPIRED, 'sign-in expired'), Math.max(0, endsAt - Date.now()));
+        ws.on('close', () => clearTimeout(expiry));
+      }
       const name = url.searchParams.get('project');
       // The client speaks first (sync step 1) the moment the socket opens,
       // possibly before the project has finished loading: queue until ready.
@@ -1088,9 +1140,22 @@ export async function startServer(options: ServerOptions) {
         ws.close(status === 404 ? 4404 : status === 403 ? 4403 : 1011, (err as Error).message.slice(0, 120));
       });
     });
-  });
+  };
 
+  const server = createServer(onRequest);
+  server.on('upgrade', (request, socket, head) => void onUpgrade(request, socket, head));
   await new Promise<void>((done) => server.listen(options.port, options.host, done));
+
+  // The Cloudflare door: loopback only, for the tunnel daemon on this
+  // machine. Every connection on it is marked so that identity there comes
+  // from the Cloudflare Access token alone (identity.ts).
+  let cloudflareServer: ReturnType<typeof createServer> | null = null;
+  if (options.cloudflare) {
+    cloudflareServer = createServer(onRequest);
+    cloudflareServer.on('connection', (socket) => admitCloudflareSocket(socket));
+    cloudflareServer.on('upgrade', (request, socket, head) => void onUpgrade(request, socket, head));
+    await new Promise<void>((done) => cloudflareServer!.listen(options.cloudflare!.port, '127.0.0.1', done));
+  }
 
   const urls: string[] = [];
   const hosts = options.host === '0.0.0.0' || options.host === '::'
@@ -1100,8 +1165,10 @@ export async function startServer(options: ServerOptions) {
 
   return {
     urls,
+    cloudflarePort: cloudflareServer ? options.cloudflare!.port : undefined,
     async close() {
       server.close();
+      cloudflareServer?.close();
       for (const ws of wss.clients) ws.terminate();
       await Promise.all([...projects.values()].map(async (p) => (await p.catch(() => null))?.close()));
     },

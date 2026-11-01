@@ -3,7 +3,7 @@ import * as syncProtocol from 'y-protocols/sync';
 import * as awarenessProtocol from 'y-protocols/awareness';
 import * as encoding from 'lib0/encoding';
 import * as decoding from 'lib0/decoding';
-import { MSG_AWARENESS, MSG_SYNC, type ServerEvent } from './protocol.ts';
+import { CLOSE_SIGN_IN_EXPIRED, MSG_AWARENESS, MSG_SYNC, type ServerEvent } from './protocol.ts';
 
 /**
  * A minimal Yjs WebSocket provider shared by the browser client and the
@@ -22,6 +22,17 @@ export interface ProviderOptions {
    * epoch changed). The provider has stopped; the local doc must be replaced.
    */
   onReset?: () => void;
+  /**
+   * The sign-in in front of the server (Cloudflare Access) has run out. The
+   * provider has stopped; signing in again takes a page load.
+   */
+  onSignInExpired?: () => void;
+  /**
+   * Asked before each reconnect: is the server now behind a sign-in this
+   * client no longer holds? A lapsed sign-in turns the WebSocket upgrade into
+   * a redirect, which the browser reports only as an unexplained close.
+   */
+  signInLapsed?: () => Promise<boolean>;
   /** Extra constructor arg for Node's WebSocket (headers). */
   wsOptions?: unknown;
 }
@@ -118,10 +129,24 @@ export class Provider {
         this,
       );
       if (this.closed) return;
+      if (event.code === CLOSE_SIGN_IN_EXPIRED) {
+        this.closed = true;
+        this.opts.onSignInExpired?.();
+        return;
+      }
       this.opts.onStatus?.('disconnected', event.reason || undefined);
       // 4403/4404: permission or missing project — retrying will not help.
       if (event.code === 4403 || event.code === 4404) return;
-      setTimeout(() => this.connect(), this.backoff);
+      setTimeout(() => {
+        if (this.closed) return;
+        if (!this.opts.signInLapsed) { this.connect(); return; }
+        void this.opts.signInLapsed().then((lapsed) => {
+          if (this.closed) return;
+          if (!lapsed) { this.connect(); return; }
+          this.closed = true;
+          this.opts.onSignInExpired?.();
+        });
+      }, this.backoff);
       this.backoff = Math.min(this.backoff * 2, 5000);
     };
     ws.onerror = () => { /* onclose follows */ };

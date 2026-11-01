@@ -14,6 +14,7 @@ import type { AuthorInfo } from '@shared/protocol.ts';
 import type { CommentThread } from '@shared/comments.ts';
 import { api, copyText, dialog, h, initials, menu, storedName, storeName, themeButton, toast, withName } from './ui.ts';
 import { showPicker, showShareDialog, type Me } from './picker.ts';
+import { signInAgain, signInLapsed } from './signIn.ts';
 
 /**
  * The project editor: file tree | code editor | PDF viewer, with live
@@ -302,6 +303,8 @@ export async function renderEditor(app: HTMLElement, project: string, meInfo: Me
       const dot = status === 'connected' ? 'ok' : status === 'connecting' ? 'warn' : 'bad';
       statusConn.replaceChildren(h('span', { class: `dot ${dot}` }), status === 'connected' ? 'live' : status === 'connecting' ? 'connecting…' : `offline${detail ? ` — ${detail}` : ' — reconnecting'}`);
     },
+    onSignInExpired: () => signInAgain((message) => statusConn.replaceChildren(h('span', { class: 'dot bad' }), `offline — ${message}`)),
+    signInLapsed,
     onSynced: () => {
       if (synced) return;
       synced = true;

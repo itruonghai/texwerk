@@ -27,6 +27,11 @@ export interface Identity {
   login: string;
   name: string;
   color: string;
+  /**
+   * Signed in through the Cloudflare door rather than the tailnet: a guest
+   * from the internet (see cloudflareAccess.ts and isGuest in access.ts).
+   */
+  external?: boolean;
 }
 
 export interface CompileSummary {
@@ -51,6 +56,13 @@ export interface CompileIssue {
   line: number | null;
   message: string;
 }
+
+/**
+ * WebSocket close code: the Cloudflare Access sign-in the socket was opened
+ * with has run out. Reconnecting would only be refused; a page load goes
+ * through the sign-in again.
+ */
+export const CLOSE_SIGN_IN_EXPIRED = 4440;
 
 export type ServerEvent =
   /**

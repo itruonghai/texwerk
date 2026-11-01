@@ -1,6 +1,7 @@
 import type { IncomingMessage } from 'node:http';
 import { colorFor } from '../shared/files.ts';
 import type { Identity } from '../shared/protocol.ts';
+import { cloudflarePersonOf, isCloudflareRequest } from './cloudflareAccess.ts';
 
 /**
  * Who is making a request — the same model as DeckWerk's collab server.
@@ -14,6 +15,10 @@ import type { Identity } from '../shared/protocol.ts';
  *
  * Without `--access` there is no identity to trust: the browser sends the
  * name its user typed, which is used for carets and history only.
+ *
+ * A request on the Cloudflare listener (cloudflareAccess.ts) is whoever its
+ * verified Cloudflare Access token names, or nobody: it arrives over loopback
+ * from the tunnel daemon carrying whatever headers the visitor sent.
  */
 export interface AccessConfig {
   admin: string;
@@ -37,6 +42,10 @@ export function resolveIdentity(request: IncomingMessage, access: AccessConfig |
   if (!access) {
     const name = (claimedName ?? '').trim().slice(0, 60) || 'Anonymous';
     return make(`guest:${name.toLowerCase()}`, name);
+  }
+  if (isCloudflareRequest(request)) {
+    const person = cloudflarePersonOf(request);
+    return person ? { ...make(person.login, person.name), external: true } : null;
   }
   if (!isLoopback(request)) return null;
   const login = header(request, 'tailscale-user-login').toLowerCase();

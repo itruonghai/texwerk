@@ -38,6 +38,8 @@ export interface Me {
   you: { login: string; name: string };
   access: boolean;
   admin: boolean;
+  /** Signed in through Cloudflare Access: opens what is shared with them, creates nothing. */
+  guest?: boolean;
 }
 
 const folderOf = (id: string) => (id.includes('/') ? id.slice(0, id.lastIndexOf('/')) : '');
@@ -262,10 +264,12 @@ export function showPicker(opts: { me: Me; dismissable: boolean; folder?: string
   ]));
   const actions = h('div', { class: 'picker-footer-actions' },
     opts.dismissable ? h('button', { onclick: close }, 'Cancel') : '',
-    h('button', { onclick: newProject }, 'New project…'),
-    h('button', { onclick: newFolder }, 'New folder…'),
-    importBtn,
-    h('button', { title: 'Deleted projects and folders', onclick: () => showProjectTrash(() => void render()) }, 'Trash…'));
+    ...(opts.me.guest ? [] : [
+      h('button', { onclick: newProject }, 'New project…'),
+      h('button', { onclick: newFolder }, 'New folder…'),
+      importBtn,
+      h('button', { title: 'Deleted projects and folders', onclick: () => showProjectTrash(() => void render()) }, 'Trash…'),
+    ]));
 
   const who = opts.me.access ? h('span', { class: 'picker-who', title: opts.me.you.login }, `${opts.me.you.name}${opts.me.admin ? ' · admin' : ''}`) : '';
   box.append(

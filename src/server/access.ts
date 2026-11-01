@@ -101,13 +101,22 @@ export async function writeAccess(projectDir: string, access: ProjectAccess): Pr
   await rename(partial, sidecar(projectDir));
 }
 
+/**
+ * A guest from the internet (signed in through Cloudflare Access), unless
+ * they are the admin, whose email is theirs on either door. Guests get what is
+ * shared with them by name, never what "public" gives everyone on the tailnet.
+ */
+export function isGuest(identity: Identity, config: AccessConfig): boolean {
+  return identity.external === true && identity.login !== normalizeLogin(config.admin);
+}
+
 /** This person's role, or null if they may not open the project at all. */
-export function roleFor(login: string, access: ProjectAccess, config: AccessConfig): ProjectRole | null {
+export function roleFor(login: string, access: ProjectAccess, config: AccessConfig, guest = false): ProjectRole | null {
   if (login === normalizeLogin(config.admin) || access.owner === login) return 'owner';
   const granted: AccessRole[] = [];
   const share = access.sharedWith.find((entry) => entry.login === login);
   if (share) granted.push(share.role);
-  if (access.visibility === 'public') granted.push(access.publicRole);
+  if (access.visibility === 'public' && !guest) granted.push(access.publicRole);
   if (granted.length === 0) return null;
   return granted.includes('edit') ? 'edit' : 'view';
 }
