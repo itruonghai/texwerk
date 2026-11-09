@@ -669,6 +669,11 @@ export class OverleafLink {
         doc.buffered = null;
         doc.ot = null;
         return;
+      } else if (this.uploading.has(path)) {
+        // Our own upload, and the file is gone from here since: never bring it back.
+        doc.buffered = null;
+        doc.ot = null;
+        return;
       } else {
         await this.project.putFile(path, Buffer.from(remoteText, 'utf8'), LINK_AUTHOR);
       }
@@ -1074,6 +1079,13 @@ export class OverleafLink {
         if (p && this.state.docs[id]) this.state.docs[id].path = p;
         if (p && this.state.files[id]) this.state.files[id].path = p;
       }
+      for (const id of this.tree.subtree(entity.id)) {
+        if (this.tree.nodes.get(id)?.kind !== 'doc') continue;
+        const p = this.tree.path(id);
+        const from = p && (p === move.to ? move.from : `${move.from}/${p.slice(move.to.length + 1)}`);
+        if (p && from && this.uploading.has(from)) { this.uploading.set(p, this.uploading.get(from)!); this.uploading.delete(from); }
+        if (p && !this.docs.get(id)?.ot && this.project.texts.has(p)) await this.joinDoc(id, p);
+      }
     }
     const remote = this.tree.byPath();
     const local = this.localPaths();
@@ -1107,10 +1119,14 @@ export class OverleafLink {
         this.uploading.delete(path);
         this.tree.add(made.id, { kind: 'file', name: path.split('/').pop()!, parent: folder });
         this.state.files[made.id] = { path, hash: hashBytes(data) };
-      } else if (!this.tree.nodes.has(made.id)) {
-        // Join it now rather than wait for Overleaf's event about it.
-        this.tree.add(made.id, { kind: 'doc', name: path.split('/').pop()!, parent: folder });
-        await this.joinDoc(made.id, path);
+      } else {
+        if (!this.tree.nodes.has(made.id)) this.tree.add(made.id, { kind: 'doc', name: path.split('/').pop()!, parent: folder });
+        // Join it now rather than wait for Overleaf's event about it, unless
+        // it was moved or deleted here while the upload was on its way: then
+        // the next pass renames or deletes it on Overleaf, and it is joined
+        // where it is then (a join must never bring back a file from here).
+        if (this.project.texts.has(path)) await this.joinDoc(made.id, path);
+        this.scheduleTree();
       }
     }
     // Deletions: entities known to both sides that are gone here.
@@ -1156,8 +1172,13 @@ export class OverleafLink {
   }
 
   private async onRemoteNew(parent: string, e: Record<string, unknown>, kind: EntityKind): Promise<void> {
-    // Already known (one we made ourselves): nothing new.
-    if (typeof e._id === 'string' && this.tree.nodes.has(e._id) && (kind !== 'doc' || this.docs.get(e._id)?.ot)) return;
+    // Already known (one we made ourselves, maybe renamed since): its name
+    // in the event may be out of date. Join it if it is a doc here not joined yet.
+    if (typeof e._id === 'string' && this.tree.nodes.has(e._id)) {
+      const known = this.tree.path(e._id);
+      if (kind === 'doc' && known && !this.docs.get(e._id)?.ot && this.project.texts.has(known)) await this.joinDoc(e._id, known);
+      return;
+    }
     const id = this.tree.insert(parent, e, kind);
     if (!id) return;
     const path = this.tree.path(id);

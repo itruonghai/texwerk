@@ -722,3 +722,24 @@ test('review: reconnecting repeatedly keeps one connection, and stop closes it',
   await sleep(200);
   assert.equal(w.mock.clients.size, 0);
 });
+
+test('live: a file moved or deleted here while its upload is on its way is not brought back or uploaded twice', async () => {
+  const w = await world({ overleaf: { 'main.tex': 'm\n' } });
+  w.mock.uploadDelayMs = 800;
+  await w.project.putFile('chapters/intro.tex', Buffer.from('Intro chapter.\n'), 'Bob');
+  await until('created on Overleaf', () => !!w.mock.find('chapters/intro.tex'));
+  const id = w.mock.find('chapters/intro.tex')!.id;
+  await w.project.move('chapters/intro.tex', 'chapters/introduction.tex', 'Bob');
+  await w.project.putFile('gone.tex', Buffer.from('soon gone\n'), 'Bob');
+  await until('gone.tex created on Overleaf', () => !!w.mock.find('gone.tex'));
+  await w.project.remove('gone.tex', 'Bob');
+  await until('renamed there, same entity', () => w.mock.find('chapters/introduction.tex')?.id === id);
+  await until('gone.tex deleted there', () => !w.mock.find('gone.tex'));
+  await sleep(2500);
+  await w.link.idle();
+  assert.equal(w.mock.find('chapters/intro.tex'), undefined, 'no second copy on Overleaf');
+  assert.equal(w.project.texts.has('chapters/intro.tex'), false, 'not brought back here');
+  assert.equal(w.project.texts.has('gone.tex'), false, 'not brought back here');
+  w.bob('chapters/introduction.tex', (t) => t.insert(0, 'Live: '));
+  await until('the moved file is live', () => w.mock.text('chapters/introduction.tex') === 'Live: Intro chapter.\n');
+});

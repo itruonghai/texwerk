@@ -92,6 +92,8 @@ export class MockOverleaf {
   dropAfterApply = false;
   /** The access level joinProject reports. */
   permissionsLevel = 'owner';
+  /** Delay between creating an uploaded entity and answering the upload. */
+  uploadDelayMs = 0;
   /** Count of requests per route, for assertions. */
   readonly hits = new Map<string, number>();
   origin = '';
@@ -497,6 +499,7 @@ export class MockOverleaf {
       }
       if (existing) { this.removeNode(existing.id); this.broadcast('removeEntity', [existing.id]); }
       const id = isText(rel) ? this.addDoc(rel, fileData.toString('utf8')) : this.addFile(rel, fileData);
+      if (this.uploadDelayMs) await new Promise((r) => setTimeout(r, this.uploadDelayMs));
       json(200, { success: true, entity_id: id, entity_type: isText(rel) ? 'doc' : 'file' });
       return;
     }
