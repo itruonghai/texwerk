@@ -113,6 +113,14 @@ export class Project {
   lastOutput = '';
   lastLog = '';
   onUnload: (() => void) | null = null;
+  /**
+   * The Overleaf link, when the project has one (overleaf/link.ts). A linked
+   * project stays loaded with nobody in it, so edits made on Overleaf still
+   * reach the files, git and agents' mirrors.
+   */
+  overleaf: { stop(): Promise<void> } | null = null;
+  /** Told after every move of a file or folder (the Overleaf link renames on its side). */
+  onMove: ((from: string, to: string, author: string) => void) | null = null;
 
   private readonly pathOfText = new Map<Y.Text, string>();
   /** Hash of what is on disk for each file as far as we know (ours or observed). */
@@ -751,6 +759,7 @@ export class Project {
       this.settings.mainFile = mapPath(this.settings.mainFile);
       await this.saveSettings();
     }
+    this.onMove?.(from, to, author);
   }
 
   /** Restore `path` to a blob from history (or delete it if `hash` is null). */
@@ -872,7 +881,7 @@ export class Project {
     if (this.closed) return;
     if (this.unloadTimer) clearTimeout(this.unloadTimer);
     this.unloadTimer = setTimeout(() => {
-      if (this.conns.size === 0 && !this.compiling) void this.close().then(() => this.onUnload?.());
+      if (this.conns.size === 0 && !this.compiling && !this.overleaf) void this.close().then(() => this.onUnload?.());
     }, UNLOAD_AFTER_MS);
   }
 
@@ -925,7 +934,7 @@ export class Project {
    * `author` (an upload, a restore, a pull, an edit on disk): each author
    * gets a client id of its own for this session, registered in `authors`.
    */
-  private transactAs(author: string, fn: () => void, origin: unknown = { author }): void {
+  transactAs(author: string, fn: () => void, origin: unknown = { author }): void {
     let client = this.clientOf.get(author);
     if (client === undefined) {
       do { client = Math.floor(Math.random() * 0xffffffff); } while (this.authors.has(String(client)) || client === this.homeClient);
@@ -1056,13 +1065,37 @@ export class Project {
     }, { author });
   }
 
-  setResolved(id: string, resolved: boolean, author: string): void {
+  setResolved(id: string, resolved: boolean, author: string, origin: unknown = { author }): void {
     const t = this.thread(id);
     this.doc.transact(() => {
       t.set('resolved', resolved);
       t.set('resolvedBy', resolved ? author : null);
       t.set('resolvedAt', resolved ? Date.now() : null);
-    }, { author });
+    }, origin);
+  }
+
+  /**
+   * Add a whole thread that already has its messages (one that came from
+   * Overleaf). The range is checked against the text and found again by its
+   * quote if it moved. Null when the quoted text is not in the file.
+   */
+  importThread(t: Omit<CommentThread, 'id' | 'line'>, origin: unknown): string | null {
+    if (!this.anchor(t.path, t.from, t.to, t.quote)) return null;
+    const id = randomUUID().slice(0, 8);
+    this.doc.transact(() => this.putThread({ ...t, id, line: null }), origin);
+    return id;
+  }
+
+  /** Append messages as they are (authors from elsewhere); unlike reply(), this does not reopen the thread. */
+  appendMessages(id: string, messages: Array<Omit<CommentMessage, 'id'>>, origin: unknown): string[] {
+    const t = this.thread(id);
+    const added = messages.map((m) => ({ ...m, id: randomUUID().slice(0, 8) }));
+    this.doc.transact(() => (t.get('messages') as Y.Array<CommentMessage>).push(added), origin);
+    return added.map((m) => m.id);
+  }
+
+  deleteThread(id: string, origin: unknown): void {
+    if (this.comments.has(id)) this.doc.transact(() => this.comments.delete(id), origin);
   }
 
   /** Edit or delete one message; `mayModerate` lets owners change anyone's. Deleting the first message deletes the thread. */
@@ -1163,6 +1196,9 @@ export class Project {
     // which must not persist a destroyed document a second time.
     if (this.closed) return;
     this.closed = true;
+    const link = this.overleaf;
+    this.overleaf = null;
+    await link?.stop().catch((err: Error) => console.error(`[${this.name}] Overleaf link did not stop cleanly:`, err.message));
     this.stopWatching?.();
     for (const t of this.watchTimers.values()) clearTimeout(t);
     this.watchTimers.clear();

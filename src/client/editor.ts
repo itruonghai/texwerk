@@ -16,6 +16,7 @@ import type { CommentThread } from '@shared/comments.ts';
 import { api, ApiError, copyText, dialog, h, initials, menu, menuAt, storedName, storeName, themeButton, toast, withName } from './ui.ts';
 import { showPicker, showShareDialog, type Me } from './picker.ts';
 import { signInAgain, signInLapsed } from './signIn.ts';
+import { setupOverleaf } from './overleaf.ts';
 
 /**
  * The project editor: file tree | code editor | PDF viewer, with live
@@ -63,6 +64,8 @@ export async function renderEditor(app: HTMLElement, project: string, meInfo: Me
   const historyBtn = h('button', { title: 'Full edit history, labelled versions' }, 'History');
   const labelBtn = h('button', { title: 'Save a named version (a git commit)' }, 'Label version');
   const gitBtn = h('button', { title: 'Git remote, push and pull' }, 'Git…');
+  const overleafBtn = h('button', { title: 'Link this project to an Overleaf project' }, 'Overleaf…');
+  const overleafChip = h('button', { class: 'overleaf-chip', hidden: true });
   const agentBtn = h('button', { title: 'Mirror this project to your computer for your editor or agent' }, 'Agent…');
   const downloadBtn = h('button', { title: 'Download' }, 'Download ▾');
   const shareBtn = h('button', { title: 'Who can open and edit this project' }, 'Share…');
@@ -84,7 +87,8 @@ export async function renderEditor(app: HTMLElement, project: string, meInfo: Me
     h('span', { class: 'spacer' }),
     presenceEl,
     h('span', { class: 'sep' }),
-    historyBtn, labelBtn, gitBtn, agentBtn, ...(access ? [shareBtn] : []), downloadBtn, themeButton(), paneToggle);
+    overleafChip, historyBtn, labelBtn, gitBtn, overleafBtn, agentBtn, ...(access ? [shareBtn] : []), downloadBtn, themeButton(), paneToggle);
+  const overleaf = setupOverleaf(project, overleafBtn, overleafChip);
 
   const statusConn = h('span', {}, h('span', { class: 'dot' }), 'connecting');
   const statusCompile = h('span', {});
@@ -426,6 +430,9 @@ export async function renderEditor(app: HTMLElement, project: string, meInfo: Me
       void api<{ compile: CompileSummary; output: string; log: string }>('GET', `/api/compile?project=${encodeURIComponent(project)}`)
         .then((r) => viewer.setCompile(r.compile, r.output, r.log));
       tree.render();
+      overleaf.refresh();
+    } else if (event.t === 'overleaf') {
+      overleaf.update(event.info);
     } else if (event.t === 'compile') {
       setCompile(event.compile);
       if (event.compile.state === 'done') {
@@ -450,7 +457,7 @@ export async function renderEditor(app: HTMLElement, project: string, meInfo: Me
   function applyReadOnly(): void {
     roBadge.hidden = !readOnly;
     updateTitleAffordance();
-    for (const b of [compileMore, labelBtn, gitBtn, agentBtn]) b.hidden = readOnly;
+    for (const b of [compileMore, labelBtn, gitBtn, overleafBtn, agentBtn]) b.hidden = readOnly;
     tree.setReadOnly(readOnly);
     if (currentPath) {
       const path = currentPath;

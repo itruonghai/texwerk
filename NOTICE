@@ -1,0 +1,13 @@
+TeXWerk
+Copyright (c) 2026 Vincent Sitzmann. Licensed under the MIT License (see LICENSE).
+
+src/server/overleaf/ot.ts is adapted from Lattice
+(https://github.com/leo1oel/lattice, commit 21c71f5e0e1c0095e907a1151c47083118948453,
+files src/overleaf/ot.ts and src/overleaf/changed-runs.ts), which carries this notice:
+
+  Lattice
+  Copyright 2026 Leonardo and the Lattice contributors
+  Lattice is licensed under the Apache License, Version 2.0.
+
+That file is used under the Apache License, Version 2.0; its full text is in
+licenses/Apache-2.0.txt. The changes made to it are listed at the top of the file.

@@ -20,6 +20,8 @@ import {
 } from './cloudflareAccess.ts';
 import { itemPath, listTrash, moveToTrash, restoreFromTrash, ROOT_TRASH, validTrashId, type TrashMeta } from './trash.ts';
 import { Project, type Conn } from './project.ts';
+import { OverleafLink, previewLink, readLinkState, type Choices } from './overleaf/link.ts';
+import { cookieHeader, OverleafError, parseProjectUrl } from './overleaf/socketio.ts';
 import { readZip, writeZip } from './zip.ts';
 import { allThreads, commentsMarkdown, sortThreads } from '../shared/comments.ts';
 import { messagesSince, parseRef, type ChatRef } from '../shared/chat.ts';
@@ -224,6 +226,8 @@ export async function startServer(options: ServerOptions) {
         const p = new Project(clean, dir);
         await p.open();
         p.onUnload = () => { if (projects.get(clean) === pending) projects.delete(clean); };
+        const linked = readLinkState(dir);
+        if (linked) new OverleafLink(p, linked).start();
         return p;
       })();
       projects.set(clean, pending);
@@ -1062,6 +1066,66 @@ export async function startServer(options: ServerOptions) {
       return json(response, r.ok ? 200 : 400, r.ok ? { output: r.output } : { error: r.output });
     }
 
+    // ---------------------------------------------------- Overleaf link
+    // Anyone with the project open sees the link's state; only its owner
+    // links, unlinks or gives a new cookie. The cookie never comes back out.
+
+    if (path === '/api/overleaf' && method === 'GET') {
+      const link = project.overleaf instanceof OverleafLink ? project.overleaf : null;
+      const manage = !access || canManage(identity.login, await readAccess(project.dir, access), access);
+      return json(response, 200, { info: link ? link.info() : null, canManage: manage });
+    }
+
+    if (path.startsWith('/api/overleaf/') && method === 'POST') {
+      await requireRole(identity, projectParam ?? '', 'manage');
+      const body = await readJson<{ url?: string; cookie?: string; choices?: Choices }>(request);
+      const link = project.overleaf instanceof OverleafLink ? project.overleaf : null;
+      const failure = (err: unknown) => {
+        if (err instanceof OverleafError) return new HttpError(err.kind === 'session' || err.kind === 'access' ? 400 : 502, err.message);
+        return new HttpError(400, (err as Error).message);
+      };
+      if (path === '/api/overleaf/preview' || path === '/api/overleaf/link') {
+        if (link) throw new HttpError(409, 'this project is already linked to Overleaf; unlink it first');
+        let target: { origin: string; projectId: string };
+        let cookie: string;
+        try {
+          target = parseProjectUrl(String(body.url ?? ''));
+          cookie = cookieHeader(String(body.cookie ?? ''), target.origin);
+        } catch (err) { throw failure(err); }
+        if (path === '/api/overleaf/preview') {
+          try { return json(response, 200, await previewLink(project, target.origin, target.projectId, cookie)); } catch (err) { throw failure(err); }
+        }
+        const choices: Choices = {};
+        for (const [p, side] of Object.entries(body.choices ?? {})) {
+          const clean = cleanPath(p);
+          if (clean && (side === 'texwerk' || side === 'overleaf')) choices[clean] = side;
+        }
+        const started = new OverleafLink(project, {
+          origin: target.origin, projectId: target.projectId, cookie, linkedBy: identity.login, linkedByName: identity.name,
+          rootFolderId: '', docs: {}, files: {}, threads: {},
+        }, choices);
+        started.saveNow();
+        started.start();
+        return json(response, 200, { info: started.info() });
+      }
+      if (!link) throw new HttpError(404, 'this project is not linked to Overleaf');
+      if (path === '/api/overleaf/cookie') {
+        let cookie: string;
+        try { cookie = cookieHeader(String(body.cookie ?? ''), link.state.origin); } catch (err) { throw failure(err); }
+        await link.setCookie(cookie);
+        return json(response, 200, { info: link.info() });
+      }
+      if (path === '/api/overleaf/reconnect') {
+        link.reconnect();
+        return json(response, 200, { info: link.info() });
+      }
+      if (path === '/api/overleaf/unlink') {
+        await link.unlink();
+        return json(response, 200, { info: null });
+      }
+      throw new HttpError(404, 'unknown Overleaf action');
+    }
+
     if (path === '/api/zip' && method === 'GET') {
       await project.persistAll();
       response.writeHead(200, {
@@ -1160,6 +1224,24 @@ export async function startServer(options: ServerOptions) {
   const server = createServer(onRequest);
   server.on('upgrade', (request, socket, head) => void onUpgrade(request, socket, head));
   await new Promise<void>((done) => server.listen(options.port, options.host, done));
+
+  // Projects linked to Overleaf stay open (see Project.overleaf): edits made
+  // there reach the files even while nobody has the project open here.
+  const openLinked = async (dir: string, rel: string): Promise<void> => {
+    let entries;
+    try { entries = await readdir(dir, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      if (!e.isDirectory() || e.name.startsWith('.')) continue;
+      const childDir = join(dir, e.name);
+      const id = rel ? `${rel}/${e.name}` : e.name;
+      if (!cleanProjectId(id)) continue;
+      if (isFolderDir(childDir)) await openLinked(childDir, id);
+      else if (existsSync(join(childDir, '.texwerk', 'overleaf.json'))) {
+        await getProject(id).catch((err: Error) => process.stderr.write(`warning: could not open linked project ${id}: ${err.message}\n`));
+      }
+    }
+  };
+  await openLinked(rootDir, '');
 
   // The Cloudflare door: loopback only, for the tunnel daemon on this
   // machine. Every connection on it is marked so that identity there comes

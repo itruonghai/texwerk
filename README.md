@@ -156,6 +156,39 @@ must not be exposed to the open internet.
   **Cancel** or **Proceed anyway**: git keeps them in the history for good.
   **Don't ask again** stops asking for that project in that browser; Git…
   turns it back on.
+- **Overleaf link.** **Overleaf…** links a project to an Overleaf project,
+  so co-authors who stay on Overleaf and people (and agents) here edit the
+  same paper live. The owner pastes the Overleaf project address and their
+  `overleaf_session2` cookie; **Compare** shows what each side has, without
+  changing anything: files only on one side are copied to the other, and for
+  each file that differs the owner keeps one side (the other side's text
+  stays in its history). Then:
+  - text edits go both ways as they are typed, as Overleaf operations, merged
+    with what everyone is typing on either side; edits from Overleaf show as
+    "*Name* · Overleaf" in Authors and History;
+  - new, renamed, moved and deleted files and folders go across (a rename
+    stays a rename, so Overleaf keeps the file's history and comments);
+    deleting most of the project at once is not passed on to Overleaf;
+  - comment threads go both ways: a thread here gets an Overleaf thread
+    anchored on the same words, replies and resolving follow, and messages
+    from here show on Overleaf as "[*Name*] text" (Overleaf files them under
+    the linked account);
+  - a linked project stays loaded with nobody in it, so Overleaf edits reach
+    the files, git and mirrors at once; after a dropped connection the link
+    catches up from where it was, and after a server restart it merges what
+    both sides did meanwhile against the last text both had. Lines both sides
+    changed differently while apart keep both versions between
+    `%<<<<<<< TeXWerk` and `%>>>>>>> Overleaf` lines (TeX comments, so the
+    document still compiles) and the chat says where.
+
+  The chip in the toolbar shows the link's state; when the cookie expires it
+  says so, and the owner pastes a new one in the same dialog. Characters
+  outside the BMP (emoji) become U+FFFD and carriage returns are removed,
+  because that is what Overleaf stores. The link uses the endpoints
+  Overleaf's own web page uses, which are not a public API and can change;
+  `src/server/overleaf/` follows the protocol notes of
+  [Lattice](https://github.com/leo1oel/lattice) (`docs/overleaf-protocol.md`),
+  whose OT code it adapts (Apache-2.0, see `NOTICE`).
 - **Files.** Overleaf-style file tree: drag and drop files or whole folders
   from the desktop (onto the tree, a folder, or anywhere in the window), move
   files by dragging, rename, delete (restorable from history), set the main
@@ -253,6 +286,11 @@ re-sync, keeping local edits they had not sent yet.
   latexmk into `.texwerk/build/`, `identity.ts` and `access.ts` decide who
   may open or edit what, and `origin.ts` turns away other websites.
   `.texwerk/` is excluded from git.
+- `src/server/overleaf/` — the Overleaf link: `socketio.ts` (Overleaf's
+  Socket.IO 0.9 realtime channel), `ot.ts` (ShareJS-style OT client, from
+  Lattice), `rest.ts` (threads and file tree over HTTP), `merge3.ts` (line
+  three-way merge) and `link.ts`, which joins them to the project's Y.Doc. Its
+  state, with the session cookie, is in `.texwerk/overleaf.json` (mode 600).
 - `src/client/` — the browser app (CodeMirror 6 + y-codemirror.next, PDF.js).
 - `src/bridge/connect.ts` — the mirror bridge, bundled into
   `dist/texwerk-connect.mjs` and served by the server.
@@ -271,6 +309,7 @@ npm run test:fuzz                           # the mirror fuzzer, 5 seeds x 60 st
 node test/e2e-bridge.ts <origin> <project> <mirrorDir>          # with a server and a running bridge
 node test/e2e-latex-editing.ts <origin> <projectsRoot>          # completion, Enter and vim in Chromium
 node test/e2e-links-and-sync.ts <origin>                        # comment links, double-click to PDF, lineno fix
+node test/e2e-overleaf.ts                                       # the Overleaf dialog and live link in Chromium (after npm run build)
 MODE=all node test/stress-bridge.ts <origin> <project> <mirrorDir> 8
 ```
 
@@ -284,6 +323,15 @@ do by accident — `rm -rf` it while the mirror runs, recreate it, delete most o
 its files, start a second mirror on it, delete files while it is stopped — and
 check that the server keeps exactly what it should. A fuzz failure prints its
 seed; rerun it with `FUZZ_SEEDS=<seed> npm run test:fuzz`.
+
+`test/overleaf-link.test.ts` runs the link against a mock Overleaf
+(`test/support/mockOverleaf.ts`) that speaks the same protocol: the first
+link, live typing on both sides at once (with an Overleaf-side OT client and
+server latency; every keystroke must end up exactly once), dropped
+connections, server restarts with and without conflicts, a drifted copy
+caught by Overleaf's hash check, an expired cookie, the file tree both ways,
+comments both ways, and the HTTP routes. `OVERLEAF_DEBUG=1` logs the link's
+connection steps.
 
 ## Security
 
@@ -327,6 +375,11 @@ TeXWerk trusts everyone who can reach it. Please keep that in mind:
   TeXWerk pages.
 - Never expose it with `tailscale funnel`, a port forward or a reverse proxy to
   the internet.
+
+- An Overleaf link keeps the linking owner's Overleaf session cookie in the
+  project's `.texwerk/overleaf.json` (mode 600). It is never sent to browsers,
+  mirrors, git or compiles, but anyone with a shell as the server's user can
+  read it, and it opens that whole Overleaf account. Unlinking deletes it.
 
 If you find a security problem, please report it privately through GitHub's
 **Report a vulnerability** (Security tab) rather than in a public issue.

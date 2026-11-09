@@ -112,7 +112,29 @@ export type ServerEvent =
    * moved, and the reconnect resumes the same document (same epoch).
    */
   | { t: 'moved'; to: string }
-  | { t: 'notice'; message: string };
+  | { t: 'notice'; message: string }
+  /** The project's Overleaf link changed state (see OverleafInfo). */
+  | { t: 'overleaf'; info: OverleafInfo | null };
+
+/**
+ * What everyone with the project open may see of its Overleaf link. The
+ * session cookie never leaves the server.
+ */
+export interface OverleafInfo {
+  status: 'connecting' | 'live' | 'reconnecting' | 'expired' | 'lost';
+  /** Why the link is not live, in words for people. */
+  message: string;
+  /** https://www.overleaf.com/project/<id> */
+  url: string;
+  linkedBy: string;
+  /** Files where both sides changed the same lines while apart; marked in the text. */
+  conflicts: string[];
+  /**
+   * Increases with every change of state (milliseconds-based, so also across
+   * server restarts): a reply that crossed a newer event on the way is older.
+   */
+  seq: number;
+}
 
 export interface ProjectSettings {
   mainFile: string;
