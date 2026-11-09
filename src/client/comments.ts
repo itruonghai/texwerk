@@ -277,8 +277,10 @@ export class Comments {
       cards.push(card);
     }
     const scroll = this.panel.querySelector('.comments-list')?.scrollTop ?? 0;
-    // Keep a reply being typed across live updates.
-    const typing = this.panel.contains(document.activeElement) && (document.activeElement as HTMLElement).classList.contains('reply-box');
+    // Keep a reply being typed across live updates. An empty box (just after
+    // sending, say) does not hold back others' new messages.
+    const active = document.activeElement as HTMLTextAreaElement | null;
+    const typing = !!active && this.panel.contains(active) && active.classList.contains('reply-box') && active.value.trim() !== '';
     if (typing) return;
     const listEl = h('div', { class: 'comments-list' }, ...cards);
     this.panel.replaceChildren(h('div', { class: 'comments-bar' }, filter, h('span', { class: 'spacer' }), toggle), listEl);
