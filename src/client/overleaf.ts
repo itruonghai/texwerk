@@ -1,4 +1,8 @@
+import { EditorState } from '@codemirror/state';
+import { EditorView, lineNumbers } from '@codemirror/view';
+import { unifiedMergeView } from '@codemirror/merge';
 import type { OverleafInfo } from '@shared/protocol.ts';
+import { themeMode } from './codeEditor.ts';
 import { api, confirmDialog, dialog, h, toast } from './ui.ts';
 
 /**
@@ -15,7 +19,25 @@ interface LinkPreview {
   same: string[];
   toTexwerk: string[];
   toOverleaf: string[];
-  differ: Array<{ path: string; kind: 'text' | 'binary' }>;
+  differ: Array<{ path: string; kind: 'text' | 'binary'; texwerk?: string; overleaf?: string }>;
+}
+
+/** Overleaf's version as the original, TeXWerk's on top: what keeping TeXWerk would change on Overleaf. */
+function showDiff(host: HTMLElement, overleaf: string, texwerk: string): EditorView {
+  return new EditorView({
+    parent: host,
+    state: EditorState.create({
+      doc: texwerk,
+      extensions: [
+        lineNumbers(),
+        EditorView.editable.of(false),
+        EditorState.readOnly.of(true),
+        EditorView.lineWrapping,
+        unifiedMergeView({ original: overleaf, mergeControls: false, highlightChanges: true, gutter: true, collapseUnchanged: { margin: 2, minSize: 4 } }),
+        themeMode(),
+      ],
+    }),
+  });
 }
 
 const STATUS_TEXT: Record<OverleafInfo['status'], string> = {
@@ -149,7 +171,7 @@ export function setupOverleaf(project: string, button: HTMLButtonElement, chip: 
     if (!canManage) {
       return [h('p', {}, 'This project is not linked to Overleaf. Only its owner can link it.'), h('div', { class: 'actions' }, h('button', { onclick: close }, 'Close'))];
     }
-    const url = h('input', { placeholder: 'https://www.overleaf.com/project/…', spellcheck: 'false' });
+    const url = h('input', { class: 'ol-url', placeholder: 'https://www.overleaf.com/project/…', spellcheck: 'false' });
     const cookie = h('input', { type: 'password', placeholder: 'overleaf_session2 value', autocomplete: 'off', spellcheck: 'false' });
     const out = h('pre', { class: 'out', hidden: true });
     const plan = h('div', { class: 'ol-plan' });
@@ -193,7 +215,22 @@ export function setupOverleaf(project: string, button: HTMLButtonElement, chip: 
         input.addEventListener('change', () => choices.set(d.path, side));
         return h('label', {}, input, ` ${label}`);
       };
-      return h('div', { class: 'ol-row' }, h('code', {}, d.path), h('span', { class: 'muted' }, d.kind === 'binary' ? 'file' : 'text'), radio('texwerk', 'Keep TeXWerk'), radio('overleaf', 'Take Overleaf'));
+      const diffHost = h('div', { class: 'ol-diff', hidden: true });
+      let view: EditorView | null = null;
+      const toggle = d.texwerk !== undefined && d.overleaf !== undefined
+        ? h('button', { class: 'link', onclick: () => {
+          diffHost.hidden = !diffHost.hidden;
+          if (!diffHost.hidden && !view) view = showDiff(diffHost, d.overleaf!, d.texwerk!);
+          toggle!.textContent = diffHost.hidden ? 'Show differences' : 'Hide differences';
+        } }, 'Show differences')
+        : null;
+      return h('div', { class: 'ol-item' },
+        h('div', { class: 'ol-row' },
+          h('code', { title: d.path }, d.path),
+          h('span', { class: 'muted' }, d.kind === 'binary' ? 'file' : 'text'),
+          ...(toggle ? [toggle] : []),
+          h('span', { class: 'ol-choice' }, radio('texwerk', 'Keep TeXWerk'), radio('overleaf', 'Take Overleaf'))),
+        diffHost);
     });
     const list = (title: string, paths: string[]) => (paths.length
       ? [h('details', {}, h('summary', {}, `${title}: ${paths.length}`), h('div', { class: 'ol-paths' }, ...paths.map((x) => h('code', {}, x))))] : []);
@@ -211,7 +248,7 @@ export function setupOverleaf(project: string, button: HTMLButtonElement, chip: 
       ...list('Only on Overleaf', p.toTexwerk),
       ...list('Only here', p.toOverleaf),
       ...(rows.length ? [
-        h('p', {}, `${rows.length} file(s) differ. Pick the side to keep for each; the other side's text stays in its history (TeXWerk History, Overleaf History).`),
+        h('p', {}, `${rows.length} file(s) differ. Pick the side to keep for each; the other side's text stays in its history (TeXWerk History, Overleaf History). In the differences, red lines are Overleaf's and green lines TeXWerk's.`),
         h('div', { class: 'ol-differ' }, ...rows),
       ] : []),
       h('div', { class: 'actions' }, linkBtn),

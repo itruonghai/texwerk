@@ -565,7 +565,10 @@ test('HTTP: preview, link, status without the cookie, new cookie, unlink; a rest
 
   const preview = await call('POST', '/api/overleaf/preview', { url: mock.url, cookie: 'hai' });
   assert.equal(preview.status, 200, JSON.stringify(preview.body));
-  assert.deepEqual(preview.body, { name: 'Paper', account: 'Hai Test', same: [], toTexwerk: ['only-there.tex'], toOverleaf: ['only-here.tex'], differ: [{ path: 'main.tex', kind: 'text' }] });
+  assert.deepEqual(preview.body, {
+    name: 'Paper', account: 'Hai Test', same: [], toTexwerk: ['only-there.tex'], toOverleaf: ['only-here.tex'],
+    differ: [{ path: 'main.tex', kind: 'text', texwerk: 'from TeXWerk\n', overleaf: 'from Overleaf\n' }],
+  });
   assert.equal(mock.text('main.tex'), 'from Overleaf\n', 'a preview changes nothing');
 
   const linked = await call('POST', '/api/overleaf/link', { url: mock.url, cookie: 'hai', choices: { 'main.tex': 'texwerk' } });

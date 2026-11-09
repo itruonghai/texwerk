@@ -1494,9 +1494,15 @@ export interface LinkPreview {
   toTexwerk: string[];
   /** Only here: copied to Overleaf. */
   toOverleaf: string[];
-  /** On both sides with different content: the owner picks a side for each. */
-  differ: Array<{ path: string; kind: 'text' | 'binary' }>;
+  /**
+   * On both sides with different content: the owner picks a side for each.
+   * Text files carry both versions (up to PREVIEW_TEXT_LIMIT each) so the
+   * dialog can show how they differ.
+   */
+  differ: Array<{ path: string; kind: 'text' | 'binary'; texwerk?: string; overleaf?: string }>;
 }
+
+const PREVIEW_TEXT_LIMIT = 300_000;
 
 /**
  * Look at both sides without changing either: what a first link would copy
@@ -1527,6 +1533,7 @@ export async function previewLink(project: Project, origin: string, projectId: s
         await socket.call('leaveDoc', [e.id]).catch(() => {});
         const mine = here ? here.toString().replace(/\r/g, '') : null;
         if (mine === text) out.same.push(path);
+        else if (mine !== null && mine.length <= PREVIEW_TEXT_LIMIT && text.length <= PREVIEW_TEXT_LIMIT) out.differ.push({ path, kind: 'text', texwerk: mine, overleaf: text });
         else out.differ.push({ path, kind: 'text' });
       } else {
         const data = await rest.download(e.id, e.hash);

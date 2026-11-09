@@ -66,7 +66,16 @@ try {
     await page.locator('.dialog .ol-row', { hasText: 'main.tex' }).waitFor();
     assert.match(await page.locator('.dialog').innerText(), /1 are only on Overleaf and come here; 1 are only here and go to Overleaf/);
     await page.locator('.dialog .ol-row', { hasText: 'main.tex' }).getByLabel('Keep TeXWerk').check();
+    await page.locator('.dialog .ol-row', { hasText: 'main.tex' }).getByText('Show differences').click();
+    await page.locator('.dialog .ol-diff .cm-deletedChunk, .dialog .ol-diff .cm-changedLine').first().waitFor();
+    assert.match(await page.locator('.dialog .ol-diff').innerText(), /Hello from TeXWerk\./);
     await shot(page, '2-compare');
+    // Narrow: the file name keeps a line of its own instead of shrinking away.
+    await page.setViewportSize({ width: 400, height: 900 });
+    const name = await page.locator('.dialog .ol-row code', { hasText: 'main.tex' }).boundingBox();
+    assert.ok(name && name.width >= 50, `file name visible at 400 px (width ${name?.width})`);
+    await shot(page, '2b-compare-narrow');
+    await page.setViewportSize({ width: 1500, height: 950 });
     await page.locator('.dialog button', { hasText: /^Link$/ }).click();
     await page.locator('.dialog .ol-status', { hasText: 'live' }).waitFor({ timeout: 15_000 });
     await shot(page, '3-linked');
