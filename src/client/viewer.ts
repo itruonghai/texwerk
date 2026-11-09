@@ -5,7 +5,7 @@ import * as pdfjs from 'pdfjs-dist/legacy/build/pdf.mjs';
 import workerUrl from 'pdfjs-dist/legacy/build/pdf.worker.min.mjs?url';
 import type { PDFDocumentLoadingTask, PDFDocumentProxy, PDFPageProxy } from 'pdfjs-dist';
 import { extensionOf, IMAGE_EXTENSIONS } from '@shared/files.ts';
-import type { CompileIssue, CompileSummary } from '@shared/protocol.ts';
+import { formatMegabytes, type CompileIssue, type CompileSummary } from '@shared/protocol.ts';
 import { h, withName } from './ui.ts';
 
 pdfjs.GlobalWorkerOptions.workerSrc = workerUrl;
@@ -50,6 +50,101 @@ export interface TextSpot {
   exact: boolean;
 }
 
+/**
+ * A page that takes this long to draw, or has this many drawing operations,
+ * makes the PDF slow to view. Operations are counted the way PDF.js runs them:
+ * a scatter plot exported as vectors costs several per point, so 100,000
+ * points is the better part of a million.
+ */
+const SLOW_PAGE_MS = 1500;
+const HEAVY_PAGE_OPS = 150_000;
+
+/** A page of the compiled PDF that is slow to draw. */
+export interface SlowPage {
+  page: number;
+  ms: number;
+  ops: number;
+}
+
+/** A figure on a page: an image or an embedded PDF, in PDF points from the page's top-left. */
+interface FigureBox {
+  x0: number;
+  y0: number;
+  x1: number;
+  y1: number;
+}
+
+/** A double-click on a figure in the compiled PDF. */
+export interface FigureClick {
+  page: number;
+  /** The figure's centre, in PDF points from the page's top-left (what SyncTeX takes). */
+  x: number;
+  y: number;
+  /** Its place among the figures side by side with it, counted from the left. */
+  index: number;
+  count: number;
+  /** Where the double-click was, in the window. */
+  clientX: number;
+  clientY: number;
+}
+
+type Matrix = [number, number, number, number, number, number];
+const multiply = (m: Matrix, n: Matrix): Matrix => [
+  m[0] * n[0] + m[2] * n[1], m[1] * n[0] + m[3] * n[1],
+  m[0] * n[2] + m[2] * n[3], m[1] * n[2] + m[3] * n[3],
+  m[0] * n[4] + m[2] * n[5] + m[4], m[1] * n[4] + m[3] * n[5] + m[5],
+];
+
+/**
+ * The figures a page draws, from the operator list PDF.js rendered it with:
+ * every image, and every embedded PDF (a form XObject, which is how
+ * \includegraphics places a PDF), at the top level only, so the plot inside
+ * an included PDF is not a figure of its own. Boxes are in PDF user space.
+ */
+function figureBoxes(fnArray: number[], argsArray: unknown[][]): Array<[number, number, number, number]> {
+  const { OPS } = pdfjs;
+  const boxes: Array<[number, number, number, number]> = [];
+  const stack: Matrix[] = [];
+  let ctm: Matrix = [1, 0, 0, 1, 0, 0];
+  let depth = 0;
+  // A form with a transparency group carries its bounding box on the group.
+  let groupBox: [number, number, number, number] | null = null;
+  const place = (m: Matrix, x0: number, y0: number, x1: number, y1: number) => {
+    const xs: number[] = [];
+    const ys: number[] = [];
+    for (const [x, y] of [[x0, y0], [x1, y0], [x0, y1], [x1, y1]]) {
+      xs.push(m[0] * x + m[2] * y + m[4]);
+      ys.push(m[1] * x + m[3] * y + m[5]);
+    }
+    boxes.push([Math.min(...xs), Math.min(...ys), Math.max(...xs), Math.max(...ys)]);
+  };
+  for (let i = 0; i < fnArray.length; i++) {
+    const fn = fnArray[i];
+    const args = argsArray[i];
+    if (fn === OPS.save) stack.push(ctm);
+    else if (fn === OPS.restore) ctm = stack.pop() ?? ctm;
+    else if (fn === OPS.transform) ctm = multiply(ctm, args as Matrix);
+    else if (fn === OPS.beginGroup) {
+      const bbox = (args[0] as { bbox?: ArrayLike<number> | null } | undefined)?.bbox;
+      groupBox = bbox ? [bbox[0], bbox[1], bbox[2], bbox[3]] : null;
+    } else if (fn === OPS.paintFormXObjectBegin) {
+      const [matrix, bbox] = args as [Matrix | null, [number, number, number, number] | null];
+      stack.push(ctm);
+      if (matrix) ctm = multiply(ctm, [...matrix] as Matrix);
+      const box = bbox ?? groupBox;
+      groupBox = null;
+      if (depth === 0 && box) place(ctm, ...box);
+      depth++;
+    } else if (fn === OPS.paintFormXObjectEnd) {
+      ctm = stack.pop() ?? ctm;
+      depth--;
+    } else if (depth === 0 && (fn === OPS.paintImageXObject || fn === OPS.paintInlineImageXObject || fn === OPS.paintImageMaskXObject)) {
+      place(ctm, 0, 0, 1, 1);
+    }
+  }
+  return boxes;
+}
+
 export interface ViewerOptions {
   project: () => string;
   onJumpToSource: (file: string, line: number) => void;
@@ -60,6 +155,10 @@ export interface ViewerOptions {
   onPdfLoaded: () => void;
   /** The visible tab changed (the chat marks itself read). */
   onTabChange?: (tab: Tab) => void;
+  /** A figure in the compiled PDF was double-clicked (instead of jumping to the source). */
+  onFigureDoubleClick?: (click: FigureClick) => void;
+  /** Pages of the compiled PDF found slow to draw so far (empty for a new PDF). */
+  onSlowPages?: (pages: SlowPage[]) => void;
 }
 
 class PdfView {
@@ -67,14 +166,16 @@ class PdfView {
   private readonly pagesEl = h('div', { class: 'pdf-pages' });
   private doc: PDFDocumentProxy | null = null;
   private task: PDFDocumentLoadingTask | null = null;
-  private pages: Array<{ el: HTMLDivElement; page: PDFPageProxy; rendered: number; width: number; height: number }> = [];
+  private pages: Array<{ el: HTMLDivElement; page: PDFPageProxy; rendered: number; drawn?: boolean; figures?: FigureBox[]; width: number; height: number }> = [];
   private observer: IntersectionObserver;
   scale = 1;
   fitWidth = true;
   private loadToken = 0;
   onZoom: (() => void) | null = null;
-  onDoubleClick: ((page: number, x: number, y: number) => void) | null = null;
+  onDoubleClick: ((page: number, x: number, y: number, clientX: number, clientY: number) => void) | null = null;
   onPinClick: ((id: string, rect: DOMRect) => void) | null = null;
+  /** Each page's first draw: how long it took and how many operations it ran. */
+  onPageDrawn: ((page: number, ms: number, ops: number) => void) | null = null;
   private pins: PdfPin[] = [];
 
   private textCache = new Map<number, Promise<TextRun[]>>();
@@ -203,24 +304,31 @@ class PdfView {
     }, { passive: false });
   }
 
-  async load(url: string): Promise<void> {
+  /** Show the PDF at `url`; false if it could not be loaded or a newer load replaced it. */
+  async load(url: string, onProgress?: (loaded: number, total: number) => void): Promise<boolean> {
     const token = ++this.loadToken;
     const task = pdfjs.getDocument({ url });
-    let doc: PDFDocumentProxy;
-    try { doc = await task.promise; } catch { return; }
-    if (token !== this.loadToken) { void task.destroy(); return; }
+    if (onProgress) task.onProgress = ({ loaded, total }: { loaded: number; total: number }) => onProgress(loaded, total);
     const pages: typeof this.pages = [];
-    for (let i = 1; i <= doc.numPages; i++) {
-      const page = await doc.getPage(i);
-      const vp = page.getViewport({ scale: 1 });
-      const el = h('div', { class: 'pdf-page', 'data-index': String(i - 1) }) as HTMLDivElement;
-      el.addEventListener('dblclick', (e) => {
-        const rect = el.getBoundingClientRect();
-        this.onDoubleClick?.(i, (e.clientX - rect.left) / this.scale, (e.clientY - rect.top) / this.scale);
-      });
-      pages.push({ el, page, rendered: 0, width: vp.width, height: vp.height });
+    let doc: PDFDocumentProxy;
+    try {
+      doc = await task.promise;
+      if (token !== this.loadToken) { void task.destroy(); return false; }
+      for (let i = 1; i <= doc.numPages; i++) {
+        const page = await doc.getPage(i);
+        const vp = page.getViewport({ scale: 1 });
+        const el = h('div', { class: 'pdf-page', 'data-index': String(i - 1) }) as HTMLDivElement;
+        el.addEventListener('dblclick', (e) => {
+          const rect = el.getBoundingClientRect();
+          this.onDoubleClick?.(i, (e.clientX - rect.left) / this.scale, (e.clientY - rect.top) / this.scale, e.clientX, e.clientY);
+        });
+        pages.push({ el, page, rendered: 0, width: vp.width, height: vp.height });
+      }
+    } catch {
+      void task.destroy();
+      return false;
     }
-    if (token !== this.loadToken) { void task.destroy(); return; }
+    if (token !== this.loadToken) { void task.destroy(); return false; }
     // Keep the reader's place: same relative scroll position in the new PDF.
     const ratioY = this.scroll.scrollHeight > 0 ? this.scroll.scrollTop / this.scroll.scrollHeight : 0;
     const ratioX = this.scroll.scrollLeft;
@@ -235,7 +343,7 @@ class PdfView {
     // Render what will be visible before swapping, so a recompile does not flash white.
     const firstVisible = Math.floor(ratioY * pages.length);
     await Promise.all([firstVisible, firstVisible + 1].filter((i) => i < pages.length).map((i) => this.renderPage(i)));
-    if (token !== this.loadToken) return;
+    if (token !== this.loadToken) return false;
     this.pagesEl.replaceChildren(...pages.map((p) => p.el));
     this.scroll.scrollTop = ratioY * this.scroll.scrollHeight;
     this.scroll.scrollLeft = ratioX;
@@ -243,6 +351,7 @@ class PdfView {
     void old?.destroy();
     this.drawPins();
     this.onZoom?.();
+    return true;
   }
 
   clear(): void {
@@ -297,18 +406,46 @@ class PdfView {
     this.applyScale(this.fitScale());
   }
 
-  private async renderPage(index: number): Promise<void> {
+  /** Pages draw one at a time, so each one's time is its own (and the first visible comes first). */
+  private drawing: Promise<void> = Promise.resolve();
+
+  private renderPage(index: number): Promise<void> {
     const p = this.pages[index];
-    if (!p) return;
+    if (!p) return Promise.resolve();
     const scale = this.scale * (window.devicePixelRatio || 1);
-    if (p.rendered === scale) return;
+    if (p.rendered === scale) return Promise.resolve();
     p.rendered = scale;
+    const turn = this.drawing.then(() => this.drawPage(p, index, scale));
+    this.drawing = turn.catch(() => {});
+    return turn;
+  }
+
+  private async drawPage(p: (typeof this.pages)[number], index: number, scale: number): Promise<void> {
+    // Zoomed again, or a newer PDF arrived, while this one waited its turn.
+    if (p.rendered !== scale || !this.pages.includes(p)) return;
     const viewport = p.page.getViewport({ scale });
     const canvas = h('canvas') as HTMLCanvasElement;
     canvas.width = Math.floor(viewport.width);
     canvas.height = Math.floor(viewport.height);
+    const first = !p.drawn;
+    const started = performance.now();
     try {
-      await p.page.render({ canvas, viewport }).promise;
+      const task = p.page.render({ canvas, viewport });
+      await task.promise;
+      if (first) {
+        p.drawn = true;
+        // PDF.js does not publish the operator list a render ran; it is there all the same.
+        const list = (task as unknown as { _internalRenderTask?: { operatorList?: { fnArray?: number[]; argsArray?: unknown[][] } } })._internalRenderTask?.operatorList;
+        const ops = list?.fnArray?.length ?? 0;
+        // Figures, in PDF points from the page's top-left like the clicks.
+        const vp = p.page.getViewport({ scale: 1 });
+        p.figures = list?.fnArray && list.argsArray ? figureBoxes(list.fnArray, list.argsArray).map(([x0, y0, x1, y1]) => {
+          const [ax, ay] = vp.convertToViewportPoint(x0, y0);
+          const [bx, by] = vp.convertToViewportPoint(x1, y1);
+          return { x0: Math.min(ax, bx), y0: Math.min(ay, by), x1: Math.max(ax, bx), y1: Math.max(ay, by) };
+        }).filter((b) => b.x1 - b.x0 >= 4 && b.y1 - b.y0 >= 4) : [];
+        this.onPageDrawn?.(index + 1, performance.now() - started, ops);
+      }
     } catch {
       p.rendered = 0;
       return;
@@ -316,6 +453,22 @@ class PdfView {
     if (p.rendered !== scale) return;
     p.el.querySelector('canvas')?.remove();
     p.el.prepend(canvas);
+  }
+
+  /**
+   * The figure under a point (PDF points from the page's top-left): the
+   * smallest one containing it, with its place among the figures beside it.
+   */
+  figureAt(pageNumber: number, x: number, y: number): { x: number; y: number; index: number; count: number } | null {
+    const figures = this.pages[pageNumber - 1]?.figures ?? [];
+    const hits = figures.filter((b) => x >= b.x0 && x <= b.x1 && y >= b.y0 && y <= b.y1);
+    if (!hits.length) return null;
+    const hit = hits.reduce((a, b) => ((b.x1 - b.x0) * (b.y1 - b.y0) < (a.x1 - a.x0) * (a.y1 - a.y0) ? b : a));
+    // Side by side: overlapping the hit vertically by at least half the smaller height.
+    const row = figures.filter((b) => Math.min(b.y1, hit.y1) - Math.max(b.y0, hit.y0) >= Math.min(b.y1 - b.y0, hit.y1 - hit.y0) / 2
+      && !(b !== hit && b.x0 <= hit.x0 && b.x1 >= hit.x1)) // not a figure that contains this one
+      .sort((a, b) => a.x0 - b.x0);
+    return { x: (hit.x0 + hit.x1) / 2, y: (hit.y0 + hit.y1) / 2, index: Math.max(0, row.indexOf(hit)), count: row.length };
   }
 
   /** Scroll to a SyncTeX position (PDF points from the page's top-left). */
@@ -351,16 +504,30 @@ export class Viewer {
   private chatPanel: HTMLElement | null = null;
   private chatUnread = 0;
   private chatMentioned = false;
-  private loadingPdf = false;
+  /** The PDF being downloaded, and how far along it is. */
+  private pdfLoad: { loaded: number; total: number } | null = null;
+  /** The newest PDF could not be loaded, and no older one is showing. */
+  private pdfFailed = false;
 
   constructor(opts: ViewerOptions) {
     this.opts = opts;
     this.root.append(this.tabs, this.body);
     this.pdf.onZoom = () => this.renderTabs();
-    this.pdf.onDoubleClick = (page, x, y) => void this.syncToSource(page, x, y);
+    this.pdf.onDoubleClick = (page, x, y, clientX, clientY) => {
+      const figure = this.opts.onFigureDoubleClick ? this.pdf.figureAt(page, x, y) : null;
+      if (figure) this.opts.onFigureDoubleClick!({ page, ...figure, clientX, clientY });
+      else void this.syncToSource(page, x, y);
+    };
     this.pdf.onPinClick = (id, rect) => this.opts.onPinClick(id, rect);
+    this.pdf.onPageDrawn = (page, ms, ops) => {
+      if (ms < SLOW_PAGE_MS && ops < HEAVY_PAGE_OPS) return;
+      this.slowPages = [...this.slowPages.filter((s) => s.page !== page), { page, ms, ops }].sort((a, b) => a.page - b.page);
+      this.opts.onSlowPages?.(this.slowPages);
+    };
     this.render();
   }
+
+  private slowPages: SlowPage[] = [];
 
   setCompile(summary: CompileSummary, output?: string, log?: string): void {
     this.compile = summary;
@@ -368,9 +535,28 @@ export class Viewer {
     if (log !== undefined) this.log = log;
     if (summary.state === 'done' && summary.hasPdf && summary.rev !== this.lastPdfRev) {
       this.lastPdfRev = summary.rev;
-      this.loadingPdf = true;
-      void this.pdf.load(withName(`/pdf/${encodeURIComponent(this.opts.project())}/output.pdf?rev=${summary.rev}`))
-        .finally(() => { this.loadingPdf = false; this.render(); this.opts.onPdfLoaded(); });
+      const load = { loaded: 0, total: summary.pdfBytes ?? 0 };
+      this.pdfLoad = load;
+      this.pdfFailed = false;
+      if (this.slowPages.length) {
+        this.slowPages = [];
+        this.opts.onSlowPages?.([]);
+      }
+      // Over a slow link the download is most of the wait: say how far it is.
+      const onProgress = (loaded: number, total: number) => {
+        const shown = formatMegabytes(load.loaded);
+        load.loaded = loaded;
+        if (total) load.total = total;
+        if (this.pdfLoad === load && formatMegabytes(loaded) !== shown) this.render();
+      };
+      void this.pdf.load(withName(`/pdf/${encodeURIComponent(this.opts.project())}/output.pdf?rev=${summary.rev}`), onProgress)
+        .then((shown) => {
+          if (this.pdfLoad !== load) return;
+          this.pdfLoad = null;
+          this.pdfFailed = !shown && !this.pdf.loaded;
+          this.render();
+          this.opts.onPdfLoaded();
+        });
     }
     this.render();
   }
@@ -444,10 +630,16 @@ export class Viewer {
     this.pdf.reveal(page, y);
   }
 
-  private async syncToSource(page: number, x: number, y: number): Promise<void> {
+  /** The source line SyncTeX gives for a point in the compiled PDF. */
+  async sourceAt(page: number, x: number, y: number): Promise<{ file: string; line: number } | null> {
     const r = await fetch(withName(`/api/synctex/edit?project=${encodeURIComponent(this.opts.project())}&page=${page}&x=${x}&y=${y}`));
     const data = await r.json() as { file: string | null; line?: number };
-    if (data.file && data.line) this.opts.onJumpToSource(data.file, data.line);
+    return data.file && data.line ? { file: data.file, line: data.line } : null;
+  }
+
+  private async syncToSource(page: number, x: number, y: number): Promise<void> {
+    const at = await this.sourceAt(page, x, y);
+    if (at) this.opts.onJumpToSource(at.file, at.line);
   }
 
   private renderTabs(): void {
@@ -474,7 +666,10 @@ export class Viewer {
     }
     const tools = h('div', { class: 'tools' });
     // A large PDF takes a moment to arrive; until then the old one stays up.
-    if (this.loadingPdf) tools.append(h('span', { class: 'loading', title: 'The new PDF is being downloaded and rendered' }, 'loading new PDF…'));
+    // (With no PDF up yet, the PDF tab itself says so.)
+    if (this.pdfLoad && (this.pdf.loaded || this.tab !== 'pdf')) {
+      tools.append(h('span', { class: 'loading', title: 'The new PDF is being downloaded and rendered' }, `loading new PDF… ${this.loadProgress()}`.trim()));
+    }
     if (this.tab === 'pdf' && this.pdf.loaded) {
       tools.append(
         h('button', { class: 'ghost icon', title: 'Go to the cursor position in the PDF (Ctrl+Alt+→)', onclick: () => this.opts.onSyncFromCursor() }, '⇢'),
@@ -496,10 +691,7 @@ export class Viewer {
     if (this.tab === 'pdf') {
       if (this.pdf.loaded) content.push(this.pdf.scroll);
       else {
-        const c = this.compile;
-        this.empty.replaceChildren(h('div', {},
-          h('div', { class: 'big' }, c?.state === 'running' ? 'Compiling…' : 'No PDF yet'),
-          h('div', {}, c?.state === 'running' ? '' : c && c.rev > 0 ? 'The last compile produced no PDF — see the Log tab.' : 'Press Recompile (Ctrl+S).')));
+        this.empty.replaceChildren(this.emptyMessage());
         content.push(this.empty);
       }
     } else if (this.tab === 'log') {
@@ -516,6 +708,33 @@ export class Viewer {
     // Keep the PDF element alive (and scrolled) while other tabs show.
     for (const child of [...this.body.children]) if (!content.includes(child)) child.remove();
     for (const node of content) if (node.parentNode !== this.body) this.body.append(node);
+  }
+
+  /** "3.1 of 8.6 MB" while the PDF downloads. */
+  private loadProgress(): string {
+    const l = this.pdfLoad;
+    if (!l || !l.loaded) return '';
+    return l.total ? `${formatMegabytes(l.loaded)} of ${formatMegabytes(l.total)}` : formatMegabytes(l.loaded);
+  }
+
+  private emptyMessage(): HTMLElement {
+    const c = this.compile;
+    if (this.pdfLoad) {
+      return h('div', {},
+        h('div', { class: 'big' }, 'Loading the PDF…'),
+        h('div', {}, this.loadProgress() || 'Starting the download.'));
+    }
+    if (this.pdfFailed) {
+      const retry = h('button', { class: 'ghost' }, 'Try again');
+      retry.addEventListener('click', () => { this.lastPdfRev = -1; if (this.compile) this.setCompile(this.compile); });
+      return h('div', {},
+        h('div', { class: 'big' }, 'The PDF could not be loaded'),
+        h('div', {}, 'The connection may have dropped.'), retry);
+    }
+    if (c?.state === 'running') return h('div', {}, h('div', { class: 'big' }, 'Compiling…'));
+    return h('div', {},
+      h('div', { class: 'big' }, 'No PDF yet'),
+      h('div', {}, c && c.rev > 0 ? 'The last compile produced no PDF — see the Log tab.' : 'Press Recompile (Ctrl+S).'));
   }
 
   private renderLog(): void {

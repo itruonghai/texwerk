@@ -1,8 +1,8 @@
 import { execFile } from 'node:child_process';
 import { chmodSync, existsSync } from 'node:fs';
-import { appendFile, mkdir, readFile, rm } from 'node:fs/promises';
+import { appendFile, mkdir, readFile, rm, stat } from 'node:fs/promises';
 import { join } from 'node:path';
-import type { GitLabel } from '../shared/protocol.ts';
+import { LARGE_FILE_BYTES, type GitLabel } from '../shared/protocol.ts';
 
 /**
  * Every project folder is a git repository.
@@ -108,12 +108,16 @@ function explain(output: string, cwd: string): string {
   return output;
 }
 
-export function git(cwd: string, args: string[], timeoutMs = 60_000): Promise<GitResult> {
+export function git(cwd: string, args: string[], timeoutMs = 60_000, input?: string): Promise<GitResult> {
   return new Promise((resolve) => {
-    execFile('git', args, { cwd, env: envFor(cwd), timeout: timeoutMs, maxBuffer: 16 * 1024 * 1024 }, (err, stdout, stderr) => {
+    const child = execFile('git', args, { cwd, env: envFor(cwd), timeout: timeoutMs, maxBuffer: 16 * 1024 * 1024 }, (err, stdout, stderr) => {
       const output = `${stdout}${stderr}`.trim() || (err ? String(err.message) : '');
       resolve({ ok: !err, output: err ? explain(output, cwd) : output });
     });
+    // A git that exits without reading its input (a bad repository) must
+    // not take the server down with EPIPE; its exit status says what failed.
+    child.stdin?.on('error', () => {});
+    child.stdin?.end(input);
   });
 }
 
@@ -131,6 +135,67 @@ export async function ensureRepo(dir: string): Promise<void> {
   }
 }
 
+/** A blanket "every PDF" rule, as LaTeX .gitignore templates carry to keep compiled papers out. */
+const BLANKET_PDF_RULE = /^(\/|\*\*\/)?\*\.(pdf|\[pP\]\[dD\]\[fF\])$/i;
+
+/**
+ * PDFs that a blanket `*.pdf` rule in the repository's .gitignore hides but
+ * that are not compiled output: the figures. The rule is there to keep the
+ * compiled paper out of git, and TeXWerk compiles into .texwerk/ anyway, so
+ * honouring it for figures would only leave them out of every label and
+ * push, and a clone would not compile. A PDF next to a LaTeX document of the
+ * same name (`main.pdf` beside a `main.tex` with \documentclass) is compiled
+ * output and stays ignored; one beside a snippet that only includes it
+ * (`header.pdf` beside `header.tex`) is a figure. Any PDF a more specific
+ * rule (a named file, a folder) ignores stays ignored.
+ */
+export async function ignoredFigurePdfs(dir: string): Promise<string[]> {
+  const listed = await git(dir, ['ls-files', '-z', '--others', '--ignored', '--exclude-standard']);
+  if (!listed.ok) return [];
+  const candidates: string[] = [];
+  for (const f of listed.output.split('\0')) {
+    if (!/\.pdf$/i.test(f) || f.startsWith('.texwerk/')) continue;
+    const source = await readFile(join(dir, f.replace(/\.pdf$/i, '.tex')), 'utf8').catch(() => '');
+    if (!/\\documentclass/.test(source)) candidates.push(f);
+  }
+  if (!candidates.length) return [];
+  // -v names the rule that ignores each file: source, line, pattern, path.
+  const r = await git(dir, ['check-ignore', '-v', '-z', '--stdin'], 60_000, candidates.map((f) => `${f}\0`).join(''));
+  const fields = r.output.split('\0');
+  const figures: string[] = [];
+  for (let k = 0; k + 3 < fields.length; k += 4) {
+    if (BLANKET_PDF_RULE.test(fields[k + 2])) figures.push(fields[k + 3]);
+  }
+  return figures;
+}
+
+/**
+ * Files of `LARGE_FILE_BYTES` or more that `commitAll` would commit now (new
+ * or changed), largest first, so a label can ask before putting them into
+ * the history for good.
+ */
+export async function largeFilesToCommit(dir: string): Promise<Array<{ path: string; bytes: number }>> {
+  await ensureRepo(dir);
+  // Version 2: no entry starts with a space, which git()'s trim would eat.
+  const listed = await git(dir, ['status', '--porcelain=v2', '-z', '--untracked-files=all']);
+  const paths: string[] = [];
+  const fields = listed.output.split('\0');
+  // Fields before the path: changed (1), renamed or copied (2), unmerged (u), untracked (?).
+  const skip: Record<string, number> = { 1: 8, 2: 9, u: 10, '?': 1 };
+  for (let i = 0; i < fields.length; i++) {
+    const n = skip[fields[i][0]];
+    if (!n) continue;
+    paths.push(fields[i].split(' ').slice(n).join(' '));
+    if (fields[i][0] === '2') i++; // followed by the old path
+  }
+  paths.push(...await ignoredFigurePdfs(dir));
+  const sized = await Promise.all([...new Set(paths)].map(async (path) => {
+    const info = await stat(join(dir, path)).catch(() => null); // deleted: nothing to commit
+    return { path, bytes: info?.isFile() ? info.size : 0 };
+  }));
+  return sized.filter((f) => f.bytes >= LARGE_FILE_BYTES).sort((a, b) => b.bytes - a.bytes);
+}
+
 function authorArgs(name: string, email: string): string[] {
   const safeEmail = email.includes('@') ? email : `${email.replace(/[^a-z0-9._-]/gi, '_')}@texwerk.local`;
   return ['-c', `user.name=${name}`, '-c', `user.email=${safeEmail}`];
@@ -140,6 +205,11 @@ export async function commitAll(dir: string, message: string, name: string, emai
   await ensureRepo(dir);
   const add = await git(dir, ['add', '-A']);
   if (!add.ok) return add;
+  const figures = await ignoredFigurePdfs(dir);
+  for (let i = 0; i < figures.length; i += 200) {
+    const added = await git(dir, ['add', '-f', '--', ...figures.slice(i, i + 200)]);
+    if (!added.ok) return added;
+  }
   // .texwerk/ is excluded from git, except the comment threads and the
   // chat, which are part of the work: every label records them.
   for (const kept of ['comments.json', 'chat.jsonl']) {
@@ -195,7 +265,7 @@ export async function status(dir: string): Promise<GitStatus> {
     ahead = a;
     behind = b;
   }
-  const dirty = (await git(dir, ['status', '--porcelain'])).output.length > 0;
+  const dirty = (await git(dir, ['status', '--porcelain'])).output.length > 0 || (await ignoredFigurePdfs(dir)).length > 0;
   const hasCommits = (await git(dir, ['rev-parse', '--verify', '-q', 'HEAD'])).ok;
   return { branch, remote, ahead, behind, dirty, hasCommits };
 }
@@ -246,7 +316,8 @@ export async function pull(dir: string, name: string, email: string): Promise<Gi
   const foreign = await foreignState(dir, `origin/${branch}`);
   if (foreign) return { ok: false, output: foreign };
   // Unlabelled work in progress is committed first so a pull never discards it.
-  if ((await git(dir, ['status', '--porcelain'])).output) {
+  // (Git would overwrite an ignored figure with the remote's without asking.)
+  if ((await git(dir, ['status', '--porcelain'])).output || (await ignoredFigurePdfs(dir)).length) {
     const saved = await commitAll(dir, 'Changes before pull', name, email, -1);
     if (!saved.ok) return saved;
   }

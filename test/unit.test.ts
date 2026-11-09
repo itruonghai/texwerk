@@ -8,6 +8,8 @@ import * as Y from 'yjs';
 import { cleanPath, cleanProjectName, isBuildArtifact, isEditorTempFile, isTextFile } from '../src/shared/files.ts';
 import { applyEditsToYText, editsBetween, setYText } from '../src/shared/textDiff.ts';
 import { parseLog } from '../src/server/compile.ts';
+import { findInclude, graphicsPaths, includesOnLine, resolveGraphic } from '../src/shared/figures.ts';
+import { formatMegabytes, pdfSizeLevel } from '../src/shared/protocol.ts';
 import { commitAll, ensureRepo, labels } from '../src/server/git.ts';
 import { History } from '../src/server/history.ts';
 import { readZip, writeZip } from '../src/server/zip.ts';
@@ -157,6 +159,72 @@ test('labels are git commits that point back into the history', async () => {
     const { git } = await import('../src/server/git.ts');
     const tracked = (await git(dir, ['ls-files'])).output.split('\n');
     assert.deepEqual(tracked, ['main.tex']);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('PDF size: green below 15 MB, yellow below 40 MB, red above; never rounded up onto a threshold', () => {
+  assert.equal(pdfSizeLevel(2e6), 'ok');
+  assert.equal(pdfSizeLevel(14_999_999), 'ok');
+  assert.equal(pdfSizeLevel(15e6), 'warn');
+  assert.equal(pdfSizeLevel(39_999_999), 'warn');
+  assert.equal(pdfSizeLevel(77_222_791), 'bad');
+  assert.equal(formatMegabytes(14_999_999), '14.9 MB');
+  assert.equal(formatMegabytes(77_222_791), '77.2 MB');
+  assert.equal(formatMegabytes(668_761), '668 kB');
+});
+
+test('a blanket *.pdf in .gitignore keeps out compiled PDFs, not figures', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'texwerk-git-'));
+  const { mkdir } = await import('node:fs/promises');
+  try {
+    await ensureRepo(dir);
+    await mkdir(join(dir, 'figures', 'raw'), { recursive: true });
+    await writeFile(join(dir, '.gitignore'), '*.pdf\nfigures/raw/\nrebuttal-draft.pdf\n');
+    await writeFile(join(dir, 'main.tex'), '\\documentclass{article}');
+    await writeFile(join(dir, 'main.pdf'), 'compiled paper');
+    await writeFile(join(dir, 'figures', 'plot.pdf'), 'figure');
+    // A snippet that includes its figure does not compile to it.
+    await writeFile(join(dir, 'figures', 'header.tex'), '\\includegraphics{figures/header.pdf}');
+    await writeFile(join(dir, 'figures', 'header.pdf'), 'figure');
+    await writeFile(join(dir, 'figures', 'Teaser.PDF'), 'figure');
+    await writeFile(join(dir, 'figures', 'raw', 'dump.pdf'), 'kept out by a folder rule');
+    await writeFile(join(dir, 'rebuttal-draft.pdf'), 'kept out by name');
+    const { git, status } = await import('../src/server/git.ts');
+    assert.ok((await status(dir)).dirty);
+    const r = await commitAll(dir, 'Figures', 'Alice', 'alice@example.com', 1);
+    assert.ok(r.ok, r.output);
+    const tracked = (await git(dir, ['ls-files'])).output.split('\n').sort();
+    assert.deepEqual(tracked, ['.gitignore', 'figures/Teaser.PDF', 'figures/header.pdf', 'figures/header.tex', 'figures/plot.pdf', 'main.tex']);
+    // Once committed, a figure is tracked like any file: nothing left to label.
+    assert.equal((await status(dir)).dirty, false);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('large files about to be committed are listed, largest first, until they are committed', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'texwerk-git-'));
+  const { mkdir } = await import('node:fs/promises');
+  try {
+    const { largeFilesToCommit } = await import('../src/server/git.ts');
+    await ensureRepo(dir);
+    await mkdir(join(dir, 'figures'), { recursive: true });
+    await writeFile(join(dir, '.gitignore'), '*.pdf\n');
+    await writeFile(join(dir, 'main.tex'), '\\documentclass{article}');
+    await writeFile(join(dir, 'figures', 'small.png'), Buffer.alloc(1000));
+    await writeFile(join(dir, 'figures', 'big.png'), Buffer.alloc(12e6));
+    await writeFile(join(dir, 'figures', 'huge.pdf'), Buffer.alloc(30e6)); // hidden by *.pdf, committed anyway
+    assert.deepEqual(await largeFilesToCommit(dir), [
+      { path: 'figures/huge.pdf', bytes: 30e6 },
+      { path: 'figures/big.png', bytes: 12e6 },
+    ]);
+    assert.ok((await commitAll(dir, 'Figures', 'Alice', 'alice@example.com', 1)).ok);
+    assert.deepEqual(await largeFilesToCommit(dir), []);
+    // A changed large file is committed again, in full.
+    await writeFile(join(dir, 'figures', 'big.png'), Buffer.alloc(12e6, 1));
+    assert.deepEqual((await largeFilesToCommit(dir)).map((f) => f.path), ['figures/big.png']);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -564,4 +632,40 @@ test('Enter picks a completion typed out in full, unless picking it would add no
   assert.equal(enterIsNewline({ label: 'item', apply: 'item' }, 'item'), true);
   assert.equal(enterIsNewline({ label: 'sitzmann2019srn', apply: 'sitzmann2019srn' }, 'sitzmann2019srn'), true);
   assert.equal(enterIsNewline({ label: 'sec:intro' }, 'sec:intro'), true);
+});
+
+test('figure double-click: the \\includegraphics behind a figure, and the file it shows', () => {
+  assert.deepEqual(includesOnLine('  \\includegraphics[width=0.3\\linewidth, trim={1 2 3 4}]{c}\\includegraphics*{d.pdf} % \\includegraphics{x}'), ['c', 'd.pdf']);
+  assert.deepEqual(includesOnLine('% \\includegraphics{x}'), []);
+  assert.deepEqual(includesOnLine('100\\% \\includegraphics{y}'), ['y']);
+  const tex = [
+    '\\begin{figure}[h]',                                   // 1
+    '  \\includegraphics{b.pdf}\\hfill',                     // 2
+    '  \\includegraphics{e}',                                // 3
+    '  \\caption{Two on separate lines.}',                   // 4
+    '\\end{figure}',                                         // 5
+    '\\begin{figure}[h]',                                   // 6
+    '  \\includegraphics{c}\\includegraphics{d}',             // 7
+    '  \\caption{Two on one line.}',                         // 8
+    '\\end{figure}',                                         // 9
+    'Plain text.',                                          // 10
+  ].join('\n');
+  // SyncTeX names the include's own line.
+  assert.deepEqual(findInclude(tex, 3, 1, 2), { line: 3, name: 'e' });
+  // Two on one line: SyncTeX names the caption; left-to-right order decides.
+  assert.deepEqual(findInclude(tex, 8, 0, 2), { line: 7, name: 'c' });
+  assert.deepEqual(findInclude(tex, 8, 1, 2), { line: 7, name: 'd' });
+  assert.deepEqual(findInclude(tex, 7, 1, 2), { line: 7, name: 'd' });
+  // The caption of the first figure: its two includes, by position.
+  assert.deepEqual(findInclude(tex, 4, 0, 2), { line: 2, name: 'b.pdf' });
+  assert.equal(findInclude('Just text.\nMore.', 1, 0, 1), null);
+
+  assert.deepEqual(graphicsPaths(['\\graphicspath{{figs/}{./img}}', 'no paths']), ['figs/', './img']);
+  const files = ['main.tex', 'figs/a.pdf', 'figs/a.png', 'img/teaser.png', 'src/figures/header/header.pdf', 'b.pdf'];
+  assert.equal(resolveGraphic('a', files, ['figs/']), 'figs/a.pdf'); // .pdf before .png, like pdfLaTeX
+  assert.equal(resolveGraphic('teaser', files, ['figs/', './img']), 'img/teaser.png');
+  assert.equal(resolveGraphic('./b.pdf', files, []), 'b.pdf');
+  assert.equal(resolveGraphic('src/figures/header/header.pdf', files, []), 'src/figures/header/header.pdf');
+  assert.equal(resolveGraphic('header', files, []), 'src/figures/header/header.pdf'); // found by name
+  assert.equal(resolveGraphic('missing', files, ['figs/']), null);
 });

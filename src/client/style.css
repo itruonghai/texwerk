@@ -460,6 +460,7 @@ code { color: var(--cyan); }
 @keyframes fadeout { 0%, 50% { opacity: 1; } 100% { opacity: 0; } }
 .viewer-empty { display: grid; position: absolute; inset: 0; place-items: center; padding: 24px; color: var(--muted); text-align: center; }
 .viewer-empty .big { margin-bottom: 8px; color: var(--dim); font-size: 13px; }
+.viewer-empty button { margin-top: 10px; }
 .image-view { display: grid; position: absolute; inset: 0; overflow: auto; place-items: center; padding: 16px;
   background: repeating-conic-gradient(#1c1d27 0% 25%, #16161e 0% 50%) 50% / 20px 20px; }
 .image-view img { max-width: 100%; max-height: 100%; box-shadow: 0 2px 10px rgb(0 0 0 / 50%); }
@@ -723,6 +724,7 @@ button.picker-row.active { border-color: var(--accent); }
 .picker-live { color: var(--accent) !important; font-weight: 600 !important; }
 .picker-folder .picker-name::before { content: '📁  '; }
 .picker-row-button { flex: none; }
+.picker-more { display: none; }
 
 /* Share dialog: two questions — which people, then everyone else. */
 .share-body { display: flex; flex-direction: column; gap: 16px; }
@@ -744,6 +746,17 @@ button.picker-row.active { border-color: var(--accent); }
 .share-add { display: flex; gap: 6px; }
 .share-add input { flex: 1; min-width: 0; }
 
+.large-files .bad { color: var(--danger); }
+.actions .dont-ask { display: flex; gap: 6px; align-items: center; margin-right: auto; color: var(--dim); cursor: pointer; }
+/* The compiled PDF's size in the menu bar: green, yellow, red as it grows. */
+.toolbar .pdf-info { display: inline-flex; gap: 8px; align-items: center; background: none; }
+.toolbar .pdf-info[hidden] { display: none; }
+.toolbar .pdf-info.ok { border-color: color-mix(in srgb, var(--green) 45%, transparent); }
+.toolbar .pdf-info.warn { border-color: var(--yellow); }
+.toolbar .pdf-info.bad { border-color: var(--danger); }
+.pdf-info .size.ok, .pdf-size-text.ok { color: var(--green); }
+.pdf-info .size.warn, .pdf-size-text.warn { color: var(--yellow); }
+.pdf-info .size.bad, .pdf-size-text.bad, .pdf-info .slow { color: var(--danger); }
 .readonly-badge { padding: 1px 6px; border: 1px solid var(--yellow); color: var(--yellow); font-size: 10px; letter-spacing: .06em; text-transform: uppercase; }
 
 button.busy { opacity: .75; cursor: progress; }
@@ -764,6 +777,69 @@ button.busy { opacity: .75; cursor: progress; }
   .picker { --picker-columns: minmax(0, 1fr) 90px; width: 100vw; height: 100vh; }
   .picker-row .picker-cell:nth-child(n+4) { display: none; }
   .picker-actions { width: auto; }
+}
+
+/* On a phone the projects browser is the whole page, and a row is a name with
+   a line of facts under it — size, last edit, who is in it, owner, access —
+   instead of columns. A row's buttons fold away behind its ⋯. */
+@media (max-width: 640px) {
+  .picker-overlay { place-items: stretch; }
+  .picker {
+    --picker-gutter: 12px;
+    width: 100vw;
+    height: 100vh;
+    height: 100dvh;
+    border: 0;
+    padding: env(safe-area-inset-top) env(safe-area-inset-right) 0 env(safe-area-inset-left);
+  }
+  .picker-head { flex-wrap: wrap; gap: 6px; }
+  .picker-head h2 { font-size: 12px; }
+  .picker-trail { flex-basis: 100%; order: 3; }
+  .picker-who { margin-left: auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .picker-columns { display: none; }
+  .picker-list { padding-top: 6px; padding-bottom: 6px; }
+  .picker-group { margin-top: 18px; padding: 0 10px 4px; }
+  .picker-row-group { flex-wrap: wrap; gap: 0; border-bottom: 1px solid var(--line); }
+  .picker-row {
+    display: flex;
+    min-height: 52px;
+    flex-wrap: wrap;
+    align-content: center;
+    gap: 3px 10px;
+    padding: 9px 10px;
+  }
+  .picker-name { flex: 1 0 100%; font-size: 15px; }
+  .picker-row .picker-cell:nth-child(n+4) { display: revert; }
+  /* Created: last edit says more on a small screen. */
+  .picker-row .picker-cell:nth-child(4), .picker-row .picker-cell:empty { display: none; }
+  .picker-cell { max-width: 100%; }
+  .picker-more {
+    display: block;
+    flex: none;
+    width: 44px;
+    min-height: 44px;
+    padding: 0;
+    border: 0;
+    background: none;
+    color: var(--muted);
+    font-size: 18px;
+  }
+  .picker-row-group.open .picker-more { color: var(--text); }
+  .picker-actions { display: none; }
+  .picker-row-group.open .picker-actions {
+    display: flex;
+    flex: 1 0 100%;
+    flex-wrap: wrap;
+    justify-content: flex-start;
+    gap: 6px;
+    padding: 0 10px 10px;
+  }
+  .picker-row-button { min-height: 36px; }
+  .picker-crumb { min-height: 32px; }
+  .picker-foot { flex-wrap: wrap; padding-bottom: max(12px, env(safe-area-inset-bottom)); }
+  .picker-foot .picker-progress { flex-basis: 100%; }
+  .picker-footer-actions { flex: 1 0 100%; flex-wrap: wrap; margin-left: 0; }
+  .picker-footer-actions > * { flex: 1 1 auto; min-height: 40px; }
 }
 
 .deploy-key { display: flex; flex-direction: column; gap: 8px; }
@@ -808,6 +884,7 @@ button.busy { opacity: .75; cursor: progress; }
 /* Spelling and grammar (spellcheck.ts). */
 .cm-spell-error { text-decoration: underline wavy var(--danger); text-decoration-thickness: 1px; text-underline-offset: 3px; text-decoration-skip-ink: none; }
 .cm-spell-grammar { text-decoration: underline wavy var(--accent); text-decoration-thickness: 1px; text-underline-offset: 3px; text-decoration-skip-ink: none; }
+.menu .menu-head.figure-name { max-width: 360px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-transform: none; letter-spacing: 0; }
 .menu .menu-head.spell-message { text-transform: none; letter-spacing: 0; max-width: 320px; white-space: normal; }
 
 /* ------------------------------------------------------------ light theme */

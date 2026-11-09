@@ -48,6 +48,35 @@ export interface CompileSummary {
   issues: CompileIssue[];
   /** latexmk found nothing changed since the last compile. */
   upToDate?: boolean;
+  /** Size of the compiled PDF, which every viewer downloads after each compile. */
+  pdfBytes?: number;
+  /** The biggest project files the compile read (1 MB and up), largest first: what makes the PDF big. */
+  heaviestInputs?: Array<{ path: string; bytes: number }>;
+}
+
+/**
+ * A PDF this size or more is slow to fetch after every compile, more so for
+ * collaborators at home: the menu bar shows its size in yellow, then red.
+ */
+export const PDF_SIZE_WARN = 15e6;
+export const PDF_SIZE_BAD = 40e6;
+
+export function pdfSizeLevel(bytes: number): 'ok' | 'warn' | 'bad' {
+  return bytes >= PDF_SIZE_BAD ? 'bad' : bytes >= PDF_SIZE_WARN ? 'warn' : 'ok';
+}
+
+/**
+ * A file this size or more asks for confirmation before a label commits it:
+ * git keeps every version forever, so it stays in the repository and every
+ * clone downloads it, even after it is deleted or shrunk. GitHub warns about
+ * files over 50 MB and refuses them over 100 MB.
+ */
+export const LARGE_FILE_BYTES = 10e6;
+export const GITHUB_MAX_FILE_BYTES = 100e6;
+
+export function formatMegabytes(bytes: number): string {
+  // Rounded down, so a PDF just under a threshold never reads as on it.
+  return bytes < 1e6 ? `${Math.max(1, Math.floor(bytes / 1e3))} kB` : `${(Math.floor(bytes / 1e5) / 10).toFixed(1)} MB`;
 }
 
 export interface CompileIssue {

@@ -147,7 +147,15 @@ must not be exposed to the open internet.
   **Label version** commits the whole project, authored by you, and the label
   appears in the history, where the project can be reverted to it. **Git…**
   sets a remote and pushes/pulls; it can generate the server's SSH key to add
-  as a deploy key.
+  as a deploy key. A blanket `*.pdf` rule in the repository's `.gitignore`
+  (common in LaTeX templates) keeps out only compiled PDFs (`main.pdf` next
+  to a `main.tex` with `\documentclass`): figure PDFs are committed anyway, so
+  a clone compiles. More specific rules (a named file, a folder) are obeyed.
+  Before a label (or a pull, which first commits unlabelled work) commits a
+  file of 10 MB or more, a dialog lists the large files and asks to
+  **Cancel** or **Proceed anyway**: git keeps them in the history for good.
+  **Don't ask again** stops asking for that project in that browser; Git…
+  turns it back on.
 - **Files.** Overleaf-style file tree: drag and drop files or whole folders
   from the desktop (onto the tree, a folder, or anywhere in the window), move
   files by dragging, rename, delete (restorable from history), set the main
@@ -156,12 +164,24 @@ must not be exposed to the open internet.
   zoom, SyncTeX both ways: double-click the PDF to jump to the source;
   double-click the source — which still selects the word — or press
   `Ctrl+Alt+→` / ⇢ to jump to that place in the PDF), or the image/PDF
-  selected in the file tree.
+  selected in the file tree. Double-clicking an included figure (an image or
+  PDF placed by `\includegraphics`) opens a small menu right there: **Jump
+  into figure** shows its file, **Jump to where it is included** goes to the
+  `\includegraphics` line.
 - **Compile.** `latexmk` with pdfLaTeX, XeLaTeX or LuaLaTeX; auto-compile after
   edits or `Ctrl+S` / `Ctrl+Enter`. `tex/` holds fixed versions of packages
   that are buggy in the server's TeX Live (lineno), found after the project's
   own files and before TeX Live's. The Log tab lists errors and warnings with
   links to the line, and the raw latexmk output and TeX log.
+- **PDF size and speed.** The menu bar shows the compiled PDF's size: green
+  below 15 MB, yellow below 40 MB, red above, since every viewer downloads the
+  whole PDF after each compile. While it downloads, the PDF pane shows how
+  much has arrived; reopening a project whose PDF has not changed reuses the
+  browser's copy (it only checks with the server that it is still current
+  and that you still have access). It also warns when a page is slow to draw
+  (1.5 s, or 150,000 drawing operations: a vector scatter plot with tens of
+  thousands of points). A click lists the largest files the paper includes
+  and the slow pages, with how to shrink or rasterize them.
 - **Download** the project as a .zip or the compiled PDF at any time. New
   projects from a template, from an uploaded .zip, or by cloning a git repo.
 

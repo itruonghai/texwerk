@@ -19,7 +19,7 @@ import { allThreads, type CommentMessage, type CommentThread, type ThreadMap } f
 import { chatArray, cleanMessage, findMentions, fromJsonl, toJsonl, type ChatMessage, type ChatRef } from '../shared/chat.ts';
 import { authorRuns } from '../shared/provenance.ts';
 import { isMassDeletion, MASS_DELETION_WINDOW_MS } from '../shared/deletionGuard.ts';
-import { BUILD_DIR, runLatexmk } from './compile.ts';
+import { BUILD_DIR, pdfWeight, runLatexmk } from './compile.ts';
 import { ensureRepo } from './git.ts';
 import { hashBytes, History } from './history.ts';
 import { listTrash, moveToTrash, PROJECT_TRASH, readEntry, restoreFromTrash, type TrashMeta } from './trash.ts';
@@ -290,6 +290,8 @@ export class Project {
       const saved = JSON.parse(await readFile(join(this.dir, BUILD_DIR, 'texwerk-compile.json'), 'utf8')) as CompileSummary & { pdf: string | null };
       this.lastPdf = saved.pdf && existsSync(saved.pdf) ? saved.pdf : null;
       this.compile = { ...saved, state: 'done', hasPdf: Boolean(this.lastPdf) };
+      // Compiles saved before the PDF's size was recorded.
+      if (this.lastPdf && this.compile.pdfBytes === undefined) Object.assign(this.compile, await pdfWeight(this.dir, this.lastPdf).catch(() => ({})));
       this.lastOutput = await readFile(join(this.dir, BUILD_DIR, 'texwerk-output.txt'), 'utf8').catch(() => '');
       const stem = saved.mainFile.split('/').pop()!.replace(/\.[^.]+$/, '');
       this.lastLog = await readFile(join(this.dir, BUILD_DIR, `${stem}.log`), 'latin1').catch(() => '');
@@ -794,7 +796,17 @@ export class Project {
       this.compileQueued = by;
       return this.compiling;
     }
-    this.compiling = this.runCompile(by).finally(() => {
+    // A compile that throws (the folder moved or deleted under it, a full disk)
+    // must not reject unhandled: that would take the whole server down.
+    this.compiling = this.runCompile(by).catch((err: Error) => {
+      if (this.closed) return;
+      console.error(`[texwerk] compile of ${this.name} failed:`, err);
+      this.compile = {
+        ...this.compile, state: 'done', ok: false, finishedAt: Date.now(),
+        issues: [{ level: 'error', file: '', line: null, message: `The compile failed: ${err.message}` }],
+      };
+      this.broadcastEvent({ t: 'compile', compile: this.compile });
+    }).finally(() => {
       this.compiling = null;
       if (this.compileQueued) {
         const next = this.compileQueued;
@@ -833,6 +845,7 @@ export class Project {
       mainFile: this.settings.mainFile,
       issues: run.issues,
       upToDate: run.upToDate,
+      ...(this.lastPdf ? await pdfWeight(this.dir, this.lastPdf).catch(() => ({})) : {}),
     };
     await writeFile(join(this.dir, BUILD_DIR, 'texwerk-compile.json'), JSON.stringify({ ...this.compile, pdf: this.lastPdf }));
     this.broadcastEvent({ t: 'compile', compile: this.compile });

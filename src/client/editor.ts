@@ -2,17 +2,18 @@ import * as Y from 'yjs';
 import { Awareness } from 'y-protocols/awareness';
 import { colorFor } from '@shared/files.ts';
 import { Provider } from '@shared/provider.ts';
-import type { BinInfo, CompileSummary, Identity, ProjectSettings, ServerEvent } from '@shared/protocol.ts';
+import { formatMegabytes, GITHUB_MAX_FILE_BYTES, LARGE_FILE_BYTES, pdfSizeLevel, PDF_SIZE_BAD, PDF_SIZE_WARN, type BinInfo, type CompileSummary, type Identity, type ProjectSettings, type ServerEvent } from '@shared/protocol.ts';
 import { CodeEditor } from './codeEditor.ts';
 import { FileTree } from './tree.ts';
 import { HistoryView } from './historyView.ts';
-import { Viewer, type PdfPin } from './viewer.ts';
+import { Viewer, type FigureClick, type PdfPin, type SlowPage } from './viewer.ts';
 import { Comments } from './comments.ts';
 import { Chat } from './chat.ts';
 import { authorRuns } from '@shared/provenance.ts';
+import { findInclude, graphicsPaths, resolveGraphic } from '@shared/figures.ts';
 import type { AuthorInfo } from '@shared/protocol.ts';
 import type { CommentThread } from '@shared/comments.ts';
-import { api, copyText, dialog, h, initials, menu, storedName, storeName, themeButton, toast, withName } from './ui.ts';
+import { api, ApiError, copyText, dialog, h, initials, menu, menuAt, storedName, storeName, themeButton, toast, withName } from './ui.ts';
 import { showPicker, showShareDialog, type Me } from './picker.ts';
 import { signInAgain, signInLapsed } from './signIn.ts';
 
@@ -57,6 +58,8 @@ export async function renderEditor(app: HTMLElement, project: string, meInfo: Me
   });
   const compileBtn = h('button', { class: 'primary', title: 'Compile (Ctrl+S / Ctrl+Enter)' }, '▶ Recompile');
   const compileMore = h('button', { class: 'primary', title: 'Compile settings' }, '▾');
+  // The compiled PDF's size, and a warning when pages are slow to draw.
+  const pdfInfoBtn = h('button', { class: 'pdf-info', hidden: true });
   const historyBtn = h('button', { title: 'Full edit history, labelled versions' }, 'History');
   const labelBtn = h('button', { title: 'Save a named version (a git commit)' }, 'Label version');
   const gitBtn = h('button', { title: 'Git remote, push and pull' }, 'Git…');
@@ -77,6 +80,7 @@ export async function renderEditor(app: HTMLElement, project: string, meInfo: Me
     titleEl,
     roBadge,
     h('span', { class: 'group' }, compileBtn, compileMore),
+    pdfInfoBtn,
     h('span', { class: 'spacer' }),
     presenceEl,
     h('span', { class: 'sep' }),
@@ -172,6 +176,84 @@ export async function renderEditor(app: HTMLElement, project: string, meInfo: Me
     onPinClick: (id, rect) => comments.openThread(id, rect),
     onPdfLoaded: () => schedulePins(0),
     onTabChange: (tab) => { if (tab === 'chat') chat.shown(); },
+    onSlowPages: (pages) => { slowPages = pages; renderPdfInfo(); },
+    onFigureDoubleClick: (click) => void figureMenu(click),
+  });
+
+  /**
+   * A double-click on an included figure: a small menu right there, to open
+   * the figure's file or go to the \includegraphics that places it. Anything
+   * else (or a figure we cannot trace) jumps to the source as before.
+   */
+  async function figureMenu(click: FigureClick): Promise<void> {
+    const at = await viewer.sourceAt(click.page, click.x, click.y);
+    if (!at) return;
+    const source = texts.get(at.file)?.toString();
+    const include = source ? findInclude(source, at.line, click.index, click.count) : null;
+    if (!include) { openFile(at.file, at.line); return; }
+    const files = [...texts.keys(), ...bins.keys()];
+    const graphic = resolveGraphic(include.name, files, graphicsPaths([...texts.values()].map((t) => t.toString())));
+    menuAt(click.clientX, click.clientY, [
+      h('div', { class: 'menu-head figure-name', title: graphic ?? include.name }, graphic ?? include.name),
+      h('button', {
+        disabled: !graphic,
+        title: graphic ? `Show ${graphic}` : `No file in the project matches "${include.name}"`,
+        onclick: () => graphic && openFile(graphic),
+      }, 'Jump into figure'),
+      h('button', { onclick: () => openFile(at.file, include.line) },
+        'Jump to where it is included', h('span', { class: 'hint' }, `${at.file.split('/').pop()}:${include.line}`)),
+    ]);
+  }
+
+  // ------------------------------------------------------------ PDF weight
+  let slowPages: SlowPage[] = [];
+  const pageList = (pages: SlowPage[]) => {
+    const numbers = pages.map((p) => p.page);
+    return `page${numbers.length === 1 ? '' : 's'} ${numbers.length > 3 ? `${numbers.slice(0, 3).join(', ')}…` : numbers.join(', ')}`;
+  };
+
+  function renderPdfInfo(): void {
+    const bytes = compile?.hasPdf ? compile.pdfBytes : undefined;
+    pdfInfoBtn.hidden = bytes === undefined && !slowPages.length;
+    if (pdfInfoBtn.hidden) return;
+    const level = bytes === undefined ? 'ok' : pdfSizeLevel(bytes);
+    pdfInfoBtn.className = `pdf-info ${slowPages.length ? 'bad' : level}`;
+    pdfInfoBtn.replaceChildren(
+      bytes !== undefined ? h('span', { class: `size ${level}` }, formatMegabytes(bytes)) : '',
+      slowPages.length ? h('span', { class: 'slow' }, `⚠ slow ${pageList(slowPages)}`) : '');
+    pdfInfoBtn.title = [
+      bytes !== undefined ? `The compiled PDF is ${formatMegabytes(bytes)}. Everyone viewing the project downloads all of it after every compile.` : '',
+      slowPages.length ? `Some pages take long to draw: ${pageList(slowPages)}.` : '',
+      'Click for details.',
+    ].filter(Boolean).join(' ');
+  }
+
+  pdfInfoBtn.addEventListener('click', () => {
+    const bytes = compile?.hasPdf ? compile.pdfBytes : undefined;
+    const heavy = compile?.heaviestInputs ?? [];
+    dialog((close) => [
+      h('h2', {}, 'PDF size and speed'),
+      ...(bytes !== undefined ? [
+        h('p', {}, 'The compiled PDF is ', h('b', { class: `pdf-size-text ${pdfSizeLevel(bytes)}` }, formatMegabytes(bytes)), '. ',
+          'Everyone viewing the project downloads the whole PDF again after every compile, so a big PDF makes each compile feel slow, more so on a home connection. ',
+          `The size shows green below ${PDF_SIZE_WARN / 1e6} MB, yellow below ${PDF_SIZE_BAD / 1e6} MB, and red above.`),
+        ...(heavy.length && pdfSizeLevel(bytes) !== 'ok' ? [
+          h('h3', {}, 'Largest files the paper includes'),
+          h('ul', {}, ...heavy.map((f) => h('li', {}, h('code', {}, f.path), ` — ${formatMegabytes(f.bytes)}`))),
+          h('p', { class: 'muted' }, 'Figures exported at print resolution with losslessly stored images are the usual culprits. 300 dpi JPEG images are plenty for a paper: re-export them, or shrink a PDF figure with ',
+            h('code', {}, 'gs -sDEVICE=pdfwrite -dPDFSETTINGS=/printer -sColorConversionStrategy=RGB -o small.pdf big.pdf'), '.'),
+        ] : []),
+      ] : []),
+      ...(slowPages.length ? [
+        h('h3', {}, 'Slow pages'),
+        h('ul', {}, ...slowPages.map((p) => h('li', {},
+          `Page ${p.page}: ${(p.ms / 1000).toFixed(1)} s to draw here`,
+          p.ops ? `, ${p.ops.toLocaleString('en-US')} drawing operations` : '', '.'))),
+        h('p', {}, 'Usually a plot with very many vector elements, such as a scatter plot with tens of thousands of points: every viewer redraws each one. ',
+          'Rasterize the dense part (matplotlib: ', h('code', {}, 'rasterized=True'), ' on the scatter, then save the PDF with ', h('code', {}, 'dpi=300'), '), or save the figure as a PNG.'),
+      ] : []),
+      h('div', { class: 'actions' }, h('button', { class: 'primary', onclick: close }, 'OK')),
+    ]);
   });
 
   // ------------------------------------------------------------ comments
@@ -600,6 +682,7 @@ export async function renderEditor(app: HTMLElement, project: string, meInfo: Me
   function setCompile(summary: CompileSummary): void {
     compile = summary;
     viewer.setCompile(summary);
+    renderPdfInfo();
     const running = summary.state === 'running';
     // A compile with nothing to do finishes in a tenth of a second; keep the
     // busy state up long enough to be seen, so a click visibly did something.
@@ -712,6 +795,64 @@ export async function renderEditor(app: HTMLElement, project: string, meInfo: Me
   }
   historyBtn.addEventListener('click', openHistory);
 
+  // ------------------------------------------------------------ large files
+  type LargeFile = { path: string; bytes: number };
+
+  // "Don't ask again" holds for this project in this browser: another
+  // project's repository may well need the warning.
+  const largeFilesKey = () => `texwerk-large-files-ok:${project}`;
+  const largeFilesAllowed = () => { try { return localStorage.getItem(largeFilesKey()) === '1'; } catch { return false; } };
+  const setLargeFilesAllowed = (on: boolean) => {
+    try { if (on) localStorage.setItem(largeFilesKey(), '1'); else localStorage.removeItem(largeFilesKey()); } catch { /* private mode: ask every time */ }
+  };
+
+  function confirmLargeFiles(files: LargeFile[]): Promise<boolean> {
+    return new Promise((resolve) => {
+      let proceed = false;
+      const dontAsk = h('input', { type: 'checkbox' });
+      const cancel = h('button', { class: 'primary' }, 'Cancel');
+      const one = files.length === 1;
+      const refused = files.some((f) => f.bytes > GITHUB_MAX_FILE_BYTES);
+      const closeDialog = dialog((close) => [
+        h('h2', {}, `Commit ${files.length === 1 ? 'a large file' : `${files.length} large files`}?`),
+        h('ul', { class: 'large-files' }, ...files.map((f) => h('li', {},
+          h('code', {}, f.path), ` — ${formatMegabytes(f.bytes)}`,
+          f.bytes > GITHUB_MAX_FILE_BYTES ? h('span', { class: 'bad' }, ' (too big for GitHub)') : ''))),
+        h('p', {}, `${one ? 'This file is' : 'These files are'} ${LARGE_FILE_BYTES / 1e6} MB or more. Git keeps every version of a file for good: once committed and pushed, `,
+          `${one ? 'it stays' : 'they stay'} in the repository's history and every clone downloads ${one ? 'it' : 'them'}, even after you delete or shrink ${one ? 'it' : 'them'}. `,
+          refused ? 'GitHub refuses files over 100 MB, so a push would fail.' : 'GitHub warns about files over 50 MB and refuses them over 100 MB.'),
+        h('p', { class: 'muted' }, 'Shrinking a figure first is usually easy: 300 dpi JPEG images are plenty for a paper, and the PDF size button next to Recompile shows how.'),
+        h('div', { class: 'actions' },
+          h('label', { class: 'dont-ask', title: 'Commit large files in this project without asking, in this browser. Git… turns the question back on.' }, dontAsk, 'Don\'t ask again'),
+          cancel,
+          h('button', { class: 'danger', onclick: () => {
+            proceed = true;
+            if ((dontAsk as HTMLInputElement).checked) setLargeFilesAllowed(true);
+            close();
+          } }, 'Proceed anyway')),
+      ], { onClose: () => resolve(proceed) });
+      cancel.addEventListener('click', closeDialog);
+      // Enter should never commit the large files: the safe answer has the focus.
+      cancel.focus();
+    });
+  }
+
+  /**
+   * Send a request that commits. When the server answers with large files
+   * instead, ask, and send it again with `allowLarge` — or return null.
+   */
+  async function committing<T>(send: (allowLarge: boolean) => Promise<T>): Promise<T | null> {
+    if (largeFilesAllowed()) return send(true);
+    try {
+      return await send(false);
+    } catch (err) {
+      const files = err instanceof ApiError && err.status === 409 ? err.data.largeFiles as LargeFile[] | undefined : undefined;
+      if (!files?.length) throw err;
+      if (!await confirmLargeFiles(files)) return null;
+      return send(true);
+    }
+  }
+
   function openLabelDialog(): void {
     dialog((close) => {
       const input = h('input', { placeholder: 'e.g. Submitted to NeurIPS', spellcheck: 'false' });
@@ -721,7 +862,8 @@ export async function renderEditor(app: HTMLElement, project: string, meInfo: Me
         if (!message) { input.focus(); return; }
         go.disabled = true;
         try {
-          await api('POST', `/api/label?project=${encodeURIComponent(project)}`, { message });
+          const done = await committing((allowLarge) => api('POST', `/api/label?project=${encodeURIComponent(project)}`, { message, allowLarge }));
+          if (!done) { go.disabled = false; input.focus(); return; }
           close();
           toast(`Labelled "${message}"`, 'ok');
           if (historyView) scheduleHistoryRefresh();
@@ -769,7 +911,9 @@ export async function renderEditor(app: HTMLElement, project: string, meInfo: Me
           h('span', {}, 'branch'), h('b', {}, status.branch),
           h('span', {}, 'since label'), h('b', {}, !status.hasCommits ? 'no labels yet — label a version to make the first commit' : status.dirty ? 'unlabelled changes' : 'nothing new'),
           h('span', {}, 'remote'), h('b', {}, status.ahead === null ? (status.remote ? 'not pushed yet' : 'none')
-            : `${status.ahead} to push, ${status.behind} to pull`));
+            : `${status.ahead} to push, ${status.behind} to pull`),
+          ...(largeFilesAllowed() ? [h('span', {}, 'large files'), h('b', {}, 'committed without asking (this browser) ',
+            h('button', { class: 'ghost', onclick: () => { setLargeFilesAllowed(false); void load(); } }, 'Ask again'))] : []));
         renderKey(r.deployKey, status.remote || remote.value.trim(), r.host);
       };
       /** GitHub owner/repo from a remote URL, when it is one. */
@@ -832,7 +976,8 @@ export async function renderEditor(app: HTMLElement, project: string, meInfo: Me
         h('div', { class: 'row' },
           h('button', { onclick: openLabelDialog }, 'Label version…'),
           h('span', { class: 'spacer' }),
-          h('button', { onclick: () => void run('Pulling', () => api('POST', `/api/git/pull?project=${encodeURIComponent(project)}`)) }, 'Pull'),
+          h('button', { onclick: () => void run('Pulling', async () => (await committing((allowLarge) => api<{ output?: string }>('POST', `/api/git/pull?project=${encodeURIComponent(project)}`, { allowLarge })))
+            ?? { output: 'Pull cancelled: nothing was committed or pulled.' }) }, 'Pull'),
           h('button', { class: 'primary', onclick: () => void run('Pushing', () => api('POST', `/api/git/push?project=${encodeURIComponent(project)}`)) }, 'Push')),
         out,
         h('h3', {}, 'Deploy key'),
