@@ -58,6 +58,8 @@ export interface ThreadState {
   anchored: boolean;
   /** TeXWerk message id → Overleaf message id ('' while ours is sent but not yet seen back). */
   messages: Record<string, string>;
+  /** The text both sides last agreed on for each paired message, as each side has it, to tell which side edited it. */
+  agreed?: Record<string, { tw: string; ol: string }>;
 }
 
 export interface LinkState {
@@ -325,6 +327,8 @@ export class OverleafLink {
   private live = false;
   private retryTimer: NodeJS.Timeout | null = null;
   private retries = 0;
+  /** Bumped by every connection attempt; an older attempt that finishes later closes what it opened. */
+  private generation = 0;
   private treeTimer: NodeJS.Timeout | null = null;
   private commentTimer: NodeJS.Timeout | null = null;
   private pollTimer: NodeJS.Timeout | null = null;
@@ -369,6 +373,7 @@ export class OverleafLink {
     if (this.stopped) return;
     this.stopped = true;
     this.live = false;
+    this.generation++;
     for (const t of [this.retryTimer, this.treeTimer, this.commentTimer, this.pollTimer]) if (t) clearTimeout(t);
     for (const d of this.docs.values()) if (d.flushTimer) clearTimeout(d.flushTimer);
     this.project.doc.off('afterTransaction', this.onAfterTransaction);
@@ -395,17 +400,19 @@ export class OverleafLink {
     this.state.cookie = cookie;
     this.rest.cookie = cookie;
     this.saveNow();
-    this.socket?.close();
-    this.retries = 0;
-    if (this.retryTimer) clearTimeout(this.retryTimer);
-    if (!this.socket) void this.connect();
+    this.reconnect();
   }
 
+  /** Drop the connection (if any) and connect again now; an attempt under way is superseded. */
   reconnect(): void {
+    if (this.stopped) return;
     this.retries = 0;
-    if (this.retryTimer) clearTimeout(this.retryTimer);
-    if (this.socket) this.socket.close();
-    else void this.connect();
+    if (this.retryTimer) { clearTimeout(this.retryTimer); this.retryTimer = null; }
+    const socket = this.socket;
+    this.socket = null;
+    this.live = false;
+    socket?.close();
+    void this.connect();
   }
 
   info(): OverleafInfo {
@@ -475,6 +482,8 @@ export class OverleafLink {
 
   private async connect(): Promise<void> {
     if (this.stopped) return;
+    const generation = ++this.generation;
+    const superseded = () => this.stopped || generation !== this.generation;
     this.live = false;
     this.setStatus(this.retries ? 'reconnecting' : 'connecting', this.retries ? 'Reconnecting to Overleaf… Edits here are kept and sent when it is back.' : 'Connecting to Overleaf…');
     let socket: OverleafSocket | null = null;
@@ -482,6 +491,7 @@ export class OverleafLink {
       this.rest = new OverleafRest(this.state.origin, this.state.projectId, this.state.cookie);
       debug('connect: signing in');
       await this.rest.signIn();
+      if (superseded()) return;
       debug('connect: opening the realtime channel');
       const opened = await OverleafSocket.connect({
         origin: this.state.origin,
@@ -491,7 +501,7 @@ export class OverleafLink {
         onClose: (err) => { if (socket && this.socket === socket) this.onSocketClosed(err); },
       });
       socket = opened.socket;
-      if (this.stopped) { socket.close(); return; }
+      if (superseded()) { socket.close(); return; }
       this.socket = socket;
       debug('connect: joined, queueing the sync');
       await this.queue(() => this.onJoined(opened.joined));
@@ -504,6 +514,7 @@ export class OverleafLink {
       this.scheduleComments(0);
       this.schedulePoll();
     } catch (err) {
+      if (superseded()) { if (this.socket === socket) this.socket = null; socket?.close(); return; }
       const e = err instanceof OverleafError ? err : new OverleafError('protocol', (err as Error).message);
       // A socket that closed on its own already scheduled what comes next,
       // unless the reason is one that needs the owner (expired, no access).
@@ -652,6 +663,12 @@ export class OverleafLink {
         if (wanted !== local) {
           this.project.transactAs(`${LINK_AUTHOR} (merge)`, () => setYText(ytext, wanted), this.origin(`${LINK_AUTHOR} (merge)`));
         }
+      } else if (this.state.docs[id] && !this.uploading.has(path) && this.readBase(id) === remoteText) {
+        // Deleted here while the link was down, unchanged on Overleaf since:
+        // the deletion goes to Overleaf (syncTreeUp), the file does not come back.
+        doc.buffered = null;
+        doc.ot = null;
+        return;
       } else {
         await this.project.putFile(path, Buffer.from(remoteText, 'utf8'), LINK_AUTHOR);
       }
@@ -988,7 +1005,10 @@ export class OverleafLink {
         if (local.has(path) && unchanged) { await this.project.remove(path, LINK_AUTHOR); removed++; }
         if (kind === 'doc') { delete this.state.docs[id]; this.docs.delete(id); rmSync(this.basePath(id), { force: true }); }
         else delete this.state.files[id];
-      } else if (local.has(path) && !local.has(now)) {
+      } else if (local.has(path)) {
+        // Renamed on Overleaf while apart. A different file here at the new
+        // name is moved aside first, so neither is merged into the other.
+        if (local.has(now)) await this.moveAside(now);
         await this.project.move(path, now, LINK_AUTHOR);
       }
       if (kind === 'doc' && this.state.docs[id] && now) this.state.docs[id].path = now;
@@ -1006,7 +1026,9 @@ export class OverleafLink {
       if (e.kind !== 'file') continue;
       const st = this.state.files[e.id];
       const localHash = this.localHash(path);
-      if (st && st.path === path && localHash !== null) continue; // agreed earlier; local changes go up
+      // Agreed earlier (Overleaf gives a changed file a new id): a local change
+      // goes up, and a local deletion goes up as a deletion.
+      if (st && st.path === path) continue;
       if (localHash !== null && !st) {
         const choice = this.choices?.[path];
         if (choice === 'texwerk') { this.state.files[e.id] = { path, hash: '' }; continue; } // goes up in syncTreeUp
@@ -1104,7 +1126,7 @@ export class OverleafLink {
       if (!local.has(path) && !gone.some((g) => path.startsWith(`${g.path}/`))) gone.push({ id: e.id, kind: e.kind, path });
     }
     const files = [...remote.values()].filter((e) => e.kind !== 'folder').length;
-    const goneFiles = gone.filter((g) => g.kind !== 'folder').length;
+    const goneFiles = [...remote].filter(([p, e]) => e.kind !== 'folder' && gone.some((g) => p === g.path || p.startsWith(`${g.path}/`))).length;
     if (goneFiles > 3 && goneFiles > files / 2) {
       this.setStatus('live', `Not deleting ${goneFiles} of ${files} files on Overleaf at once. Delete them on Overleaf if you mean it.`);
       return;
@@ -1167,13 +1189,34 @@ export class OverleafLink {
     if (change.parent !== undefined) this.tree.reparent(id, change.parent);
     const after = this.tree.path(id);
     if (!before || !after || before === after) return;
-    if (this.project.exists(before) && !this.project.exists(after)) await this.project.move(before, after, LINK_AUTHOR);
+    if (this.project.exists(before)) {
+      if (this.project.exists(after)) await this.moveAside(after);
+      await this.project.move(before, after, LINK_AUTHOR);
+    }
     for (const cid of this.tree.subtree(id)) {
       const p = this.tree.path(cid);
       if (p && this.state.docs[cid]) this.state.docs[cid].path = p;
       if (p && this.state.files[cid]) this.state.files[cid].path = p;
     }
     this.scheduleSave();
+  }
+
+  /**
+   * Move a local file or folder out of the way of one Overleaf renamed onto
+   * its name: "b.tex" becomes "b (TeXWerk).tex" (then goes to Overleaf as a new
+   * file), and the chat says so.
+   */
+  private async moveAside(path: string): Promise<void> {
+    const slash = path.lastIndexOf('/');
+    const dot = path.lastIndexOf('.');
+    const cut = dot > slash + 1 && !this.project.dirs.has(path) ? dot : path.length;
+    let target = '';
+    for (let n = 1; !target || this.project.exists(target); n++) {
+      target = `${path.slice(0, cut)} (TeXWerk${n > 1 ? ` ${n}` : ''})${path.slice(cut)}`;
+    }
+    await this.project.move(path, target, LINK_AUTHOR);
+    this.project.say(`Overleaf link: a file on Overleaf was renamed to ${path}, which was taken here. The file that was here is now ${target}.`,
+      { author: LINK_AUTHOR, login: '', agent: true }, []);
   }
 
   private async onRemoteRemove(id: string): Promise<void> {
@@ -1226,57 +1269,105 @@ export class OverleafLink {
   private async syncComments(): Promise<void> {
     if (!this.socket) return;
     const threads = await this.rest.threads();
-    this.pullComments(threads);
+    await this.pullComments(threads);
     await this.pushComments(threads);
     this.scheduleSave();
   }
 
-  private pullComments(threads: Map<string, OverleafThread>): void {
+  /** "[Bob] text" (how a message from here reads on Overleaf) → "text". */
+  private incoming(content: string, author: string): string {
+    const prefix = `[${author}] `;
+    return content.startsWith(prefix) ? content.slice(prefix.length) : content;
+  }
+
+  private overleafAuthor(m: { userId: string; userName: string }): string {
+    return `${m.userId === this.rest.userId && this.state.linkedByName ? this.state.linkedByName : m.userName} · ${LINK_AUTHOR}`;
+  }
+
+  private async pullComments(threads: Map<string, OverleafThread>): Promise<void> {
     const byOverleaf = new Map(Object.entries(this.state.threads).map(([tw, st]) => [st.overleafThread, tw]));
+    // Anchors seen on the live channel can be stale by the time a thread is
+    // imported (its words edited meanwhile): ask Overleaf where they are now.
+    if ([...threads.keys()].some((tid) => !byOverleaf.has(tid))) {
+      try {
+        for (const [tid, anchor] of await this.rest.ranges()) this.anchors.set(tid, anchor);
+      } catch (err) {
+        if (err instanceof OverleafError && err.kind === 'session') throw err;
+      }
+    }
     const here = new Map(allThreads(this.project.doc).map((t) => [t.id, t]));
     for (const [tid, th] of threads) {
       const twId = byOverleaf.get(tid);
       if (!twId) {
-        // New on Overleaf: needs its anchor (from a joined document) and a first message.
+        // New on Overleaf: needs its anchor (in a joined document) and a first message.
         const anchor = this.anchors.get(tid);
         if (!anchor || !th.messages.length) continue;
         const path = this.docPath(anchor.docId);
         if (!path) continue;
         const first = th.messages[0];
-        const author = (m: typeof first) => (m.userId === this.rest.userId && this.state.linkedByName ? this.state.linkedByName : m.userName);
         const id = this.project.importThread({
           path, from: anchor.p, to: anchor.p + anchor.quote.length, quote: anchor.quote,
-          author: `${author(first)} · ${LINK_AUTHOR}`, login: '', createdAt: first.timestamp || Date.now(),
+          author: this.overleafAuthor(first), login: '', createdAt: first.timestamp || Date.now(),
           resolved: th.resolved,
-          messages: th.messages.map((m) => ({ id: randomUUID().slice(0, 8), author: `${author(m)} · ${LINK_AUTHOR}`, login: '', ts: m.timestamp || Date.now(), text: m.content })),
+          messages: th.messages.map((m) => ({ id: randomUUID().slice(0, 8), author: this.overleafAuthor(m), login: '', ts: m.timestamp || Date.now(), text: m.content })),
         }, this.origin(LINK_AUTHOR));
         if (!id) continue;
-        const imported = here.get(id) ?? allThreads(this.project.doc).find((t) => t.id === id);
-        const messages: Record<string, string> = {};
-        imported?.messages.forEach((m, i) => { messages[m.id] = th.messages[i]?.id ?? ''; });
-        this.state.threads[id] = { overleafThread: tid, docId: anchor.docId, resolved: th.resolved, anchored: true, messages };
+        const imported = allThreads(this.project.doc).find((t) => t.id === id);
+        const st: ThreadState = { overleafThread: tid, docId: anchor.docId, resolved: th.resolved, anchored: true, messages: {}, agreed: {} };
+        imported?.messages.forEach((m, i) => {
+          const o = th.messages[i];
+          st.messages[m.id] = o?.id ?? '';
+          if (o) st.agreed![m.id] = { tw: m.text, ol: o.content };
+        });
+        this.state.threads[id] = st;
         continue;
       }
       const st = this.state.threads[twId];
+      st.agreed ??= {};
       const t = here.get(twId);
       if (!t) continue; // deleted here: pushComments deletes it on Overleaf
+      const olById = new Map(th.messages.map((m) => [m.id, m]));
+      // Messages both sides have: edited or deleted on Overleaf since they last agreed.
+      for (const [twMsgId, olId] of Object.entries(st.messages)) {
+        if (!olId) continue;
+        const twMsg = t.messages.find((m) => m.id === twMsgId);
+        const olMsg = olById.get(olId);
+        if (!twMsg) continue; // deleted here: pushComments
+        if (!olMsg) {
+          // Deleted on Overleaf. The first message stays: here it carries the thread.
+          if (t.messages[0]?.id !== twMsgId) this.project.setMessage(twId, twMsgId, null, this.origin(LINK_AUTHOR));
+          delete st.messages[twMsgId];
+          delete st.agreed[twMsgId];
+          continue;
+        }
+        const agreed = st.agreed[twMsgId];
+        if (agreed && olMsg.content !== agreed.ol) {
+          const text = this.incoming(olMsg.content, twMsg.author);
+          this.project.setMessage(twId, twMsgId, text, this.origin(LINK_AUTHOR));
+          st.agreed[twMsgId] = { tw: text, ol: olMsg.content };
+        } else if (!agreed) st.agreed[twMsgId] = { tw: twMsg.text, ol: olMsg.content };
+      }
       const mapped = new Set(Object.values(st.messages).filter(Boolean));
-      const fresh = th.messages.filter((m) => !mapped.has(m.id));
-      const toImport: typeof fresh = [];
-      for (const m of fresh) {
+      const toImport: OverleafThread['messages'] = [];
+      for (const m of th.messages) {
+        if (mapped.has(m.id)) continue;
         // One of ours coming back: same account, same text, not yet paired.
         const twMsg = m.userId === this.rest.userId
           ? t.messages.find((x) => st.messages[x.id] === '' && this.outgoing(x) === m.content)
           : undefined;
-        if (twMsg) st.messages[twMsg.id] = m.id;
-        else toImport.push(m);
+        if (twMsg) {
+          st.messages[twMsg.id] = m.id;
+          st.agreed[twMsg.id] = { tw: twMsg.text, ol: m.content };
+        } else toImport.push(m);
       }
       if (toImport.length) {
         const ids = this.project.appendMessages(twId, toImport.map((m) => ({
-          author: `${m.userId === this.rest.userId && this.state.linkedByName ? this.state.linkedByName : m.userName} · ${LINK_AUTHOR}`,
-          login: '', ts: m.timestamp || Date.now(), text: m.content,
+          author: this.overleafAuthor(m), login: '', ts: m.timestamp || Date.now(), text: m.content,
         })), this.origin(LINK_AUTHOR));
-        ids.forEach((mid, i) => { st.messages[mid] = toImport[i].id; });
+        ids.forEach((mid, i) => {
+          st.messages[mid] = toImport[i].id;
+          st.agreed![mid] = { tw: toImport[i].content, ol: toImport[i].content };
+        });
       }
       if (th.resolved !== st.resolved) {
         st.resolved = th.resolved;
@@ -1301,14 +1392,32 @@ export class OverleafLink {
       if (!st) {
         const entity = remote.get(t.path);
         if (!entity || entity.kind !== 'doc' || t.from === null || t.to === null || !t.messages.length) continue;
-        st = { overleafThread: newThreadId(), docId: entity.id, resolved: false, anchored: false, messages: {} };
+        st = { overleafThread: newThreadId(), docId: entity.id, resolved: false, anchored: false, messages: {}, agreed: {} };
         this.state.threads[t.id] = st;
       }
+      st.agreed ??= {};
+      const ids = new Set(t.messages.map((m) => m.id));
       // Messages first (Overleaf's own editor posts the first message, then the anchor).
       for (const m of t.messages) {
-        if (m.id in st.messages) continue;
+        if (m.id in st.messages) {
+          // Edited here since both sides agreed.
+          const olId = st.messages[m.id];
+          const agreed = st.agreed[m.id];
+          if (olId && agreed && m.text !== agreed.tw) {
+            await this.rest.editMessage(st.overleafThread, olId, this.outgoing(m));
+            st.agreed[m.id] = { tw: m.text, ol: this.outgoing(m) };
+          }
+          continue;
+        }
         await this.rest.postMessage(st.overleafThread, this.outgoing(m));
         st.messages[m.id] = '';
+      }
+      // Deleted here.
+      for (const [twMsgId, olId] of Object.entries(st.messages)) {
+        if (ids.has(twMsgId)) continue;
+        if (olId) await this.rest.deleteMessage(st.overleafThread, olId);
+        delete st.messages[twMsgId];
+        delete st.agreed[twMsgId];
       }
       if (!st.anchored) await this.sendAnchor(t.id, st);
       if (!st.anchored) continue;

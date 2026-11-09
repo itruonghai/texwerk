@@ -264,6 +264,17 @@ export class MockOverleaf {
     this.broadcast('new-comment', [threadId, m]);
   }
 
+  editMessage(threadId: string, messageId: string, content: string): void {
+    this.threads.get(threadId)!.messages.find((m) => m.id === messageId)!.content = content;
+    this.broadcast('edit-message', [threadId, messageId, content]);
+  }
+
+  deleteMessage(threadId: string, messageId: string): void {
+    const thread = this.threads.get(threadId)!;
+    thread.messages = thread.messages.filter((m) => m.id !== messageId);
+    this.broadcast('delete-message', [threadId, messageId]);
+  }
+
   resolve(threadId: string, resolved: boolean): void {
     this.threads.get(threadId)!.resolved = resolved;
     this.broadcast(resolved ? 'resolve-thread' : 'reopen-thread', [threadId]);
@@ -441,6 +452,21 @@ export class MockOverleaf {
     let m: RegExpExecArray | null;
     if (path === '/threads' && req.method === 'GET') {
       json(200, Object.fromEntries(this.threads));
+      return;
+    }
+    if (path === '/ranges' && req.method === 'GET') {
+      json(200, [...this.nodes.values()].filter((n) => n.kind === 'doc')
+        .map((n) => ({ id: n.id, ranges: { comments: n.comments!.map((x) => ({ id: x.id, op: { ...x.op, c: pack(x.op.c) } })) } })));
+      return;
+    }
+    if ((m = /^\/thread\/(\w+)\/messages\/(\w+)\/edit$/.exec(path)) && req.method === 'POST') {
+      this.editMessage(m[1], m[2], data().content);
+      res.writeHead(204); res.end();
+      return;
+    }
+    if ((m = /^\/thread\/(\w+)\/(?:own-)?messages\/(\w+)$/.exec(path)) && req.method === 'DELETE') {
+      this.deleteMessage(m[1], m[2]);
+      res.writeHead(204); res.end();
       return;
     }
     if ((m = /^\/thread\/(\w+)\/messages$/.exec(path)) && req.method === 'POST') {

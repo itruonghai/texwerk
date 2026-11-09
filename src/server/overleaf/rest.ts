@@ -1,4 +1,4 @@
-import { OverleafError, SESSION_EXPIRED, USER_AGENT } from './socketio.ts';
+import { decodePacked, OverleafError, SESSION_EXPIRED, USER_AGENT } from './socketio.ts';
 
 /**
  * Overleaf's HTTP endpoints the link uses: comment threads, and changes to
@@ -150,6 +150,36 @@ export class OverleafRest {
 
   async postMessage(threadId: string, content: string): Promise<void> {
     await this.request('POST', `/thread/${threadId}/messages`, { content });
+  }
+
+  async editMessage(threadId: string, messageId: string, content: string): Promise<void> {
+    await this.request('POST', `/thread/${threadId}/messages/${messageId}/edit`, { content });
+  }
+
+  /** Overleaf lets an author delete their own message by one route, a project owner any message by another. */
+  async deleteMessage(threadId: string, messageId: string): Promise<void> {
+    try {
+      await this.request('DELETE', `/thread/${threadId}/own-messages/${messageId}`);
+    } catch (err) {
+      if (err instanceof OverleafError && err.kind === 'session') throw err;
+      await this.request('DELETE', `/thread/${threadId}/messages/${messageId}`);
+    }
+  }
+
+  /** Where every comment in the project is anchored now: thread → doc, position, quoted text. */
+  async ranges(): Promise<Map<string, { docId: string; p: number; quote: string }>> {
+    const body = await this.json('GET', '/ranges');
+    const out = new Map<string, { docId: string; p: number; quote: string }>();
+    for (const entry of Array.isArray(body) ? body as Array<Record<string, unknown>> : []) {
+      const docId = typeof entry.id === 'string' ? entry.id : typeof entry._id === 'string' ? entry._id : '';
+      const comments = (entry.ranges as { comments?: unknown } | undefined)?.comments;
+      if (!docId || !Array.isArray(comments)) continue;
+      for (const c of comments) {
+        const op = (c as { op?: Record<string, unknown> }).op;
+        if (op && typeof op.t === 'string' && typeof op.p === 'number') out.set(op.t, { docId, p: op.p, quote: decodePacked(String(op.c ?? '')) });
+      }
+    }
+    return out;
   }
 
   async setResolved(docId: string, threadId: string, resolved: boolean): Promise<void> {

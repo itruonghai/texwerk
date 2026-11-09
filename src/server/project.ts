@@ -1094,6 +1094,20 @@ export class Project {
     return added.map((m) => m.id);
   }
 
+  /** Change (or with null delete) one message's text as it is, without the author checks of changeMessage (for the Overleaf link). */
+  setMessage(id: string, messageId: string, text: string | null, origin: unknown): void {
+    const t = this.comments.get(id);
+    if (!t) return;
+    const messages = t.get('messages') as Y.Array<CommentMessage>;
+    const index = messages.toArray().findIndex((m) => m.id === messageId);
+    if (index < 0) return;
+    const message = messages.get(index);
+    this.doc.transact(() => {
+      messages.delete(index, 1);
+      if (text !== null) messages.insert(index, [{ ...message, text, edited: Date.now() }]);
+    }, origin);
+  }
+
   deleteThread(id: string, origin: unknown): void {
     if (this.comments.has(id)) this.doc.transact(() => this.comments.delete(id), origin);
   }

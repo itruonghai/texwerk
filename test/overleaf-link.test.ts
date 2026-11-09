@@ -595,3 +595,127 @@ test('HTTP: preview, link, status without the cookie, new cookie, unlink; a rest
   assert.deepEqual((await call('GET', '/api/overleaf')).body, { info: null, canManage: true });
   assert.equal(readLinkState(join(root, 'Paper')), null);
 });
+
+// ------------------------------------------- regressions from the review
+
+test('review: deleting a whole folder of most files is not passed on to Overleaf', async () => {
+  const files: Record<string, string> = {};
+  for (let i = 0; i < 5; i++) files[`folder/${i}.tex`] = `${i}\n`;
+  const w = await world({ overleaf: files });
+  await w.project.remove('folder', 'Bob');
+  await sleep(1500);
+  await w.link.idle();
+  assert.equal(Object.keys(w.mock.snapshot()).length, 5, 'nothing deleted on Overleaf');
+  assert.match(w.link.info().message, /Not deleting 5 of 5/);
+});
+
+test('review: a file deleted here while the link was down stays deleted, and goes on Overleaf too', async () => {
+  const w = await world({ overleaf: { 'main.tex': 'm\n', 'a.tex': 'hello\n', 'pic.png': Buffer.from([1, 2]) } });
+  await w.link.stop();
+  await w.project.remove('a.tex', 'Bob');
+  await w.project.remove('pic.png', 'Bob');
+  w.link = new OverleafLink(w.project, readLinkState(w.dir)!);
+  w.link.start();
+  await until('live', () => w.link.isLive);
+  await until('deleted on Overleaf', () => !w.mock.find('a.tex') && !w.mock.find('pic.png'));
+  assert.equal(w.project.texts.has('a.tex'), false);
+  assert.equal(w.project.bins.has('pic.png'), false);
+});
+
+test('review: a file deleted here while down but changed on Overleaf comes back (their edits are kept)', async () => {
+  const w = await world({ overleaf: { 'main.tex': 'm\n', 'a.tex': 'hello\n' } });
+  await w.link.stop();
+  await w.project.remove('a.tex', 'Bob');
+  w.mock.edit(w.alice._id, 'a.tex', [{ p: 0, i: 'Alice: ' }]);
+  w.link = new OverleafLink(w.project, readLinkState(w.dir)!);
+  w.link.start();
+  await until('live', () => w.link.isLive);
+  await converged(w);
+  assert.equal(w.text('a.tex'), 'Alice: hello\n');
+});
+
+test('review: a rename on Overleaf onto a name taken here keeps both files apart', async () => {
+  const w = await world({ overleaf: { 'a.tex': 'old source\n' } });
+  await w.link.stop();
+  await w.project.putFile('b.tex', Buffer.from('unrelated local\n'), 'Bob');
+  w.mock.rename('a.tex', 'b.tex');
+  w.link = new OverleafLink(w.project, readLinkState(w.dir)!);
+  w.link.start();
+  await until('live', () => w.link.isLive);
+  await converged(w);
+  assert.equal(w.text('b.tex'), 'old source\n');
+  assert.equal(w.text('b (TeXWerk).tex'), 'unrelated local\n');
+  assert.equal(w.mock.text('b (TeXWerk).tex'), 'unrelated local\n');
+  assert.equal(w.project.texts.has('a.tex'), false);
+  // Live, too.
+  await w.project.putFile('c.tex', Buffer.from('mine\n'), 'Bob');
+  w.mock.addDoc('d.tex', 'theirs\n');
+  await until('d here', () => w.text('d.tex') === 'theirs\n');
+  await until('c there', () => w.mock.text('c.tex') === 'mine\n');
+  w.mock.remove('c.tex');
+  await until('c gone here', () => !w.project.texts.has('c.tex'));
+  await w.project.putFile('c.tex', Buffer.from('mine again\n'), 'Bob');
+  await sleep(1200);
+  w.mock.rename('d.tex', 'c.tex');
+  await until('renamed here', () => w.text('c.tex') === 'theirs\n');
+  assert.equal(w.text('c (TeXWerk).tex'), 'mine again\n');
+});
+
+test('review: a comment whose words change before it is imported still arrives, on its current words', async () => {
+  const w = await world({ overleaf: { 'a.tex': 'hello world\n' } });
+  w.mock.comment(w.alice._id, 'a.tex', 0, 5, 'comment');
+  w.mock.edit(w.alice._id, 'a.tex', [{ p: 2, i: 'X' }]);
+  await until('thread here', () => allThreads(w.project.doc).length === 1);
+  const t = allThreads(w.project.doc)[0];
+  assert.equal(t.quote, 'heXllo');
+  assert.equal(w.text('a.tex')!.slice(t.from!, t.to!), 'heXllo');
+});
+
+test('review: message edits and deletions go both ways; the first message stays', async () => {
+  const w = await world({ overleaf: { 'a.tex': 'one two three\n' } });
+  const tid = w.mock.comment(w.alice._id, 'a.tex', 0, 3, 'original');
+  await until('thread here', () => allThreads(w.project.doc).length === 1);
+  const id = allThreads(w.project.doc)[0].id;
+  w.mock.message(w.alice._id, tid, 'second');
+  await until('second here', () => allThreads(w.project.doc)[0].messages.length === 2);
+  w.project.reply(id, 'from Bob', 'Bob', 'bob');
+  await until('Bob there', () => w.mock.threads.get(tid)!.messages.length === 3);
+
+  // Overleaf → here: edit the first, delete the second.
+  const [first, second, bobs] = w.mock.threads.get(tid)!.messages;
+  w.mock.editMessage(tid, first.id, 'edited on Overleaf');
+  w.mock.deleteMessage(tid, second.id);
+  await until('edit and delete here', () => {
+    const m = allThreads(w.project.doc)[0].messages;
+    return m.length === 2 && m[0].text === 'edited on Overleaf';
+  });
+
+  // Here → Overleaf: edit Bob's reply, then delete it.
+  const bob = allThreads(w.project.doc)[0].messages[1];
+  w.project.setMessage(id, bob.id, 'from Bob, edited', { author: 'Bob' });
+  await until('edit there', () => w.mock.threads.get(tid)!.messages.find((m) => m.id === bobs.id)?.content === '[Bob] from Bob, edited');
+  w.project.setMessage(id, bob.id, null, { author: 'Bob' });
+  await until('delete there', () => !w.mock.threads.get(tid)!.messages.some((m) => m.id === bobs.id));
+
+  // Deleting the first message on Overleaf does not delete the thread here.
+  w.mock.deleteMessage(tid, first.id);
+  await sleep(1200);
+  await w.link.idle();
+  assert.equal(allThreads(w.project.doc).length, 1);
+  assert.equal(allThreads(w.project.doc)[0].messages[0].text, 'edited on Overleaf');
+});
+
+test('review: reconnecting repeatedly keeps one connection, and stop closes it', async () => {
+  const w = await world({ overleaf: { 'a.tex': 'hello\n' } });
+  w.link.reconnect();
+  w.link.reconnect();
+  w.link.reconnect();
+  await until('live', () => w.link.isLive);
+  await sleep(500);
+  assert.equal(w.mock.clients.size, 1);
+  w.bob('a.tex', (t) => t.insert(0, 'still works: '));
+  await until('edit there', () => w.mock.text('a.tex') === 'still works: hello\n');
+  await w.link.stop();
+  await sleep(200);
+  assert.equal(w.mock.clients.size, 0);
+});
